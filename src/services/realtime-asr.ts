@@ -20,6 +20,10 @@ interface RecognitionCallbacks {
   onClose?: () => void
 }
 
+interface RecognitionOptions {
+  noiseReduction?: boolean
+}
+
 interface VoiceSignature {
   rms: number
   zeroCrossing: number
@@ -83,14 +87,21 @@ function distance(a: VoiceSignature, b: VoiceSignature) {
   )
 }
 
-export async function startRealtimeRecognition(callbacks: RecognitionCallbacks = {}) {
+function rmsLevel(input: Float32Array) {
+  let energy = 0
+  for (let i = 0; i < input.length; i += 1) energy += input[i] * input[i]
+  return Math.sqrt(energy / Math.max(1, input.length))
+}
+
+export async function startRealtimeRecognition(callbacks: RecognitionCallbacks = {}, options: RecognitionOptions = {}) {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风采集。')
+  const noiseReduction = options.noiseReduction !== false
 
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
       echoCancellation: true,
-      noiseSuppression: true,
+      noiseSuppression: noiseReduction,
       autoGainControl: false,
     },
   })
@@ -98,10 +109,31 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
   const context = new AudioContextClass()
   await context.resume()
   const source = context.createMediaStreamSource(stream)
+  const highPass = context.createBiquadFilter()
+  highPass.type = 'highpass'
+  highPass.frequency.value = 90
+  highPass.Q.value = 0.7
+  const lowPass = context.createBiquadFilter()
+  lowPass.type = 'lowpass'
+  lowPass.frequency.value = 7200
+  lowPass.Q.value = 0.7
+  const compressor = context.createDynamicsCompressor()
+  compressor.threshold.value = -28
+  compressor.knee.value = 18
+  compressor.ratio.value = 3
+  compressor.attack.value = 0.004
+  compressor.release.value = 0.18
   const processor = context.createScriptProcessor(4096, 1, 1)
   const silentGain = context.createGain()
   silentGain.gain.value = 0
-  source.connect(processor)
+  if (noiseReduction) {
+    source.connect(highPass)
+    highPass.connect(lowPass)
+    lowPass.connect(compressor)
+    compressor.connect(processor)
+  } else {
+    source.connect(processor)
+  }
   processor.connect(silentGain)
   silentGain.connect(context.destination)
 
@@ -115,7 +147,22 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
   let lastFinalText = ''
   let lastFinalEndTime = -1
   let lastFinalAt = 0
+  let noiseFloor = 0.003
+  let gateGain = 1
   const clusters: VoiceCluster[] = []
+
+  function reduceBackgroundNoise(input: Float32Array) {
+    const level = rmsLevel(input)
+    if (level < Math.max(0.006, noiseFloor * 1.8)) {
+      noiseFloor = noiseFloor * 0.94 + level * 0.06
+    }
+    const threshold = Math.max(0.006, noiseFloor * 2.1)
+    const targetGain = level < threshold ? 0.18 : 1
+    gateGain += (targetGain - gateGain) * (targetGain > gateGain ? 0.86 : 0.16)
+    const output = input.slice()
+    for (let i = 0; i < output.length; i += 1) output[i] *= gateGain
+    return output
+  }
 
   function isDuplicateFinal(text: string, endTime: number) {
     if (!text || text !== lastFinalText) return false
@@ -180,7 +227,7 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     if (feature) utteranceFeatures.push(feature)
     if (feature) utteranceAudio.push(toPcm16(samples.slice()))
     callbacks.onLevel?.(Math.min(1, (feature?.rms || 0) * 9))
-    socket.send(toPcm16(samples))
+    socket.send(toPcm16(noiseReduction ? reduceBackgroundNoise(samples) : samples))
   }
 
   socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'start' })))
@@ -248,6 +295,9 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'finish' }))
     processor.disconnect()
     source.disconnect()
+    highPass.disconnect()
+    lowPass.disconnect()
+    compressor.disconnect()
     silentGain.disconnect()
     stream.getTracks().forEach((track) => track.stop())
     await context.close()

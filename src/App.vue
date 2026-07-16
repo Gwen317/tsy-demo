@@ -71,8 +71,10 @@ interface Suggestion {
 }
 
 const STORAGE_KEY = 'tsy-demo-state-v2'
+const NOISE_REDUCTION_KEY = 'tsy-demo-noise-reduction'
 const view = ref<View>('welcome')
 const translating = ref(true)
+const noiseReduction = ref(true)
 const dialect = ref('粤语')
 const service = ref('政务咨询窗口')
 const activeConversationId = ref(1)
@@ -293,7 +295,7 @@ async function beginRecognition() {
     stopRecognition = await startRealtimeRecognition({
       onReady: () => {
         isListening.value = true
-        showToast('麦克风已连接，正在实时识别')
+        showToast(noiseReduction.value ? '麦克风已连接 · 智能降噪已开启' : '麦克风已连接，正在实时识别')
       },
       onLevel: (level) => { micLevel.value = level },
       onResult: (result) => {
@@ -343,7 +345,7 @@ async function beginRecognition() {
         interimText.value = ''
         stopRecognition = null
       },
-    })
+    }, { noiseReduction: noiseReduction.value })
   } catch (error) {
     isListening.value = false
     stopRecognition = null
@@ -604,6 +606,8 @@ async function loadAliyunConfig() {
 function resetDemo() {
   conversations.value = structuredClone(seedConversations)
   localStorage.removeItem(STORAGE_KEY)
+  localStorage.removeItem(NOISE_REDUCTION_KEY)
+  noiseReduction.value = true
   settingsOpen.value = false
   view.value = 'welcome'
   void stopLiveRecognition()
@@ -636,9 +640,14 @@ watch(conversations, (value) => {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(value.slice(0, 8)))
 }, { deep: true })
 
+watch(noiseReduction, (value) => {
+  localStorage.setItem(NOISE_REDUCTION_KEY, String(value))
+})
+
 onMounted(() => {
   void loadAliyunConfig()
   void loadVoiceprints()
+  noiseReduction.value = localStorage.getItem(NOISE_REDUCTION_KEY) !== 'false'
   const saved = localStorage.getItem(STORAGE_KEY)
   if (saved) {
     try {
@@ -796,6 +805,7 @@ onBeforeUnmount(() => {
         <label><span>默认服务窗口</span><select v-model="service"><option>政务咨询窗口</option><option>警务服务窗口</option><option>社保服务窗口</option></select></label>
         <label><span>默认识别方言</span><select v-model="dialect"><option v-for="item in dialectOptions" :key="item">{{ item }}</option></select></label>
         <label class="modal-toggle"><span><strong>自动显示译文</strong><small>识别后同步展示普通话译文</small></span><input v-model="translating" type="checkbox" /><i></i></label>
+        <label class="modal-toggle"><span><strong>智能降噪</strong><small>{{ isListening ? '暂停实时收音后可调整' : '过滤环境底噪并保留人声特征' }}</small></span><input v-model="noiseReduction" type="checkbox" :disabled="isListening" /><i></i></label>
         <div class="provider-card" :class="{ connected: aliyunConfig?.configured }">
           <span class="provider-icon"><Cloud :size="21" /></span>
           <span><strong>阿里云百炼 CosyVoice</strong><small>{{ aliyunConfig?.configured ? `${currentVoiceProfile?.name || '系统音色'} · ${currentVoiceProfile?.trait || '流式语音'}` : '等待配置 DASHSCOPE_API_KEY' }}</small></span>
