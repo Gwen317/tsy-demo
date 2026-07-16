@@ -2,6 +2,7 @@ export interface AliyunConfig {
   configured: boolean
   provider: string
   model: string
+  asr_sentence_silence_ms?: number
   voice: string
   workspace_id: string
   region: string

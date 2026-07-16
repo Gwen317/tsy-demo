@@ -20,6 +20,7 @@ const WORKSPACE_ID = process.env.DASHSCOPE_WORKSPACE_ID || 'llm-9okku7exfrpx4pkf
 const REGION = process.env.DASHSCOPE_REGION || 'cn-beijing'
 const REWRITE_MODEL = process.env.REWRITE_MODEL || 'qwen-plus'
 const ASR_MODEL = process.env.ASR_MODEL || 'fun-asr-realtime'
+const ASR_SENTENCE_SILENCE_MS = Math.min(800, Math.max(700, Number(process.env.ASR_SENTENCE_SILENCE_MS || 750)))
 const TTS_URL = 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
 const CHAT_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
 const REALTIME_TTS_URL = `wss://${WORKSPACE_ID}.${REGION}.maas.aliyuncs.com/api-ws/v1/inference`
@@ -783,7 +784,8 @@ function openRealtimeAsr(client) {
       parameters: {
         format: 'pcm',
         sample_rate: 16000,
-        semantic_punctuation_enabled: false,
+        max_sentence_silence: ASR_SENTENCE_SILENCE_MS,
+        semantic_punctuation_enabled: true,
         heartbeat: true,
       },
       input: {},
@@ -860,6 +862,7 @@ async function main() {
         configured: Boolean(API_KEY),
         provider: '阿里云百炼',
         model: MODEL,
+        asr_sentence_silence_ms: ASR_SENTENCE_SILENCE_MS,
         voice: DEFAULT_VOICE,
         workspace_id: WORKSPACE_ID,
         region: REGION,
@@ -980,6 +983,7 @@ async function main() {
     console.log(`Aliyun DashScope: ${API_KEY ? 'configured' : 'missing DASHSCOPE_API_KEY'}`)
     console.log(`CosyVoice model=${MODEL} defaultVoice=${DEFAULT_VOICE}`)
     console.log(`ASR model=${ASR_MODEL}`)
+    console.log(`ASR sentence silence=${ASR_SENTENCE_SILENCE_MS}ms`)
     console.log(`Voiceprint provider=${VOICEPRINT_PROVIDER} ${voiceprintReady ? 'configured' : 'missing credentials'}`)
   })
 }

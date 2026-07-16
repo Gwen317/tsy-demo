@@ -111,7 +111,16 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
   let ready = false
   let utteranceFeatures: VoiceSignature[] = []
   let utteranceAudio: ArrayBuffer[] = []
+  let lastFinalText = ''
+  let lastFinalEndTime = -1
+  let lastFinalAt = 0
   const clusters: VoiceCluster[] = []
+
+  function isDuplicateFinal(text: string, endTime: number) {
+    if (!text || text !== lastFinalText) return false
+    if (endTime > 0 && lastFinalEndTime > 0) return Math.abs(endTime - lastFinalEndTime) < 500
+    return Date.now() - lastFinalAt < 1200
+  }
 
   function assignSpeaker(): { speaker: 1 | 2; confidence: number } {
     if (!utteranceFeatures.length) return { speaker: 1, confidence: 0.5 }
@@ -165,6 +174,15 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     }
     if (message.type === 'result') {
       const final = Boolean(message.final)
+      const text = String(message.text || '').trim()
+      const endTime = Number(message.end_time || 0)
+      if (!text || !/[\p{L}\p{N}]/u.test(text)) return
+      if (final && isDuplicateFinal(text, endTime)) return
+      if (final) {
+        lastFinalText = text
+        lastFinalEndTime = endTime
+        lastFinalAt = Date.now()
+      }
       let assignment = final ? assignSpeaker() : { speaker: 1 as const, confidence: 0.5 }
       let staffName: string | undefined
       let voiceprintMatched = false
@@ -183,10 +201,10 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         }
       }
       callbacks.onResult?.({
-        text: String(message.text || ''),
+        text,
         final,
         beginTime: Number(message.begin_time || 0),
-        endTime: Number(message.end_time || 0),
+        endTime,
         speaker: assignment.speaker,
         speakerConfidence: assignment.confidence,
         staffName,
