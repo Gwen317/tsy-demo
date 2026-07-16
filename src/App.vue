@@ -392,8 +392,12 @@ async function recordVoiceprint() {
     showToast('请用正常音量连续朗读窗口服务用语')
     const pcm = await captureVoiceprintSample(8, (remaining) => { voiceprintRemaining.value = remaining })
     voiceprintLoading.value = true
+    showToast('录音完成，正在保存声纹样本')
     const result = await enrollVoiceprint(voiceprintStaffId.value.trim(), voiceprintStaffName.value.trim(), pcm)
-    await loadVoiceprints()
+    const existingIndex = voiceprintStaff.value.findIndex((item) => item.staff_id === result.staff_id)
+    if (existingIndex >= 0) voiceprintStaff.value[existingIndex] = result
+    else voiceprintStaff.value.push(result)
+    window.setTimeout(() => { void loadVoiceprints() }, 1200)
     showToast(`声纹录入成功 · 已有 ${result.samples} 个样本`)
   } catch (error) {
     showToast(error instanceof DOMException && error.name === 'NotAllowedError' ? '需要允许麦克风权限才能录入声纹' : error instanceof Error ? error.message : '声纹录入失败')
@@ -728,7 +732,7 @@ onBeforeUnmount(() => {
           <div class="voiceprint-heading"><span class="provider-icon"><Fingerprint :size="21" /></span><span><strong>工作人员声纹</strong><small>{{ voiceprintReady ? voiceprintStaff.length ? `${voiceprintProvider === 'xfyun' ? '讯飞在线' : '本地'} · 已登记 ${voiceprintStaff.length} 位工作人员` : `${voiceprintProvider === 'xfyun' ? '讯飞在线服务' : '本地模型'}就绪，等待录入` : '声纹服务未就绪' }}</small></span></div>
           <div class="voiceprint-fields"><label><span>工号</span><input v-model="voiceprintStaffId" :disabled="voiceprintRecording" /></label><label><span>姓名</span><input v-model="voiceprintStaffName" :disabled="voiceprintRecording" /></label></div>
           <label class="voiceprint-consent"><input v-model="voiceprintConsent" type="checkbox" :disabled="voiceprintRecording" /><span>已取得工作人员本人授权，仅保存声纹向量</span></label>
-          <button class="enroll-voiceprint" :class="{ recording: voiceprintRecording }" :disabled="!voiceprintReady || !voiceprintConsent || voiceprintLoading || isListening" @click="recordVoiceprint"><MicOff v-if="voiceprintRecording" :size="18" /><Fingerprint v-else :size="18" />{{ voiceprintRecording ? `录入中 · ${voiceprintRemaining} 秒` : isListening ? '请先暂停实时收音' : '录入 8 秒声纹样本' }}</button>
+          <button class="enroll-voiceprint" :class="{ recording: voiceprintRecording }" :disabled="!voiceprintReady || !voiceprintConsent || voiceprintRecording || voiceprintLoading || isListening" @click="recordVoiceprint"><MicOff v-if="voiceprintRecording" :size="18" /><Fingerprint v-else :size="18" />{{ voiceprintLoading ? '正在保存声纹样本' : voiceprintRecording ? `录入中 · ${voiceprintRemaining} 秒` : isListening ? '请先暂停实时收音' : '录入 8 秒声纹样本' }}</button>
           <div v-if="voiceprintStaff.length" class="voiceprint-list"><div v-for="staff in voiceprintStaff" :key="staff.staff_id"><span><strong>{{ staff.name }}</strong><small>{{ staff.staff_id }} · {{ staff.samples }} 个样本</small></span><button title="删除声纹" :disabled="voiceprintLoading" @click="removeVoiceprint(staff.staff_id)"><Trash2 :size="16" /></button></div></div>
         </section>
         <footer><button class="reset-button" @click="resetDemo"><RotateCcw :size="17" /> 重置演示数据</button><button class="save-button" @click="settingsOpen = false; showToast('设置已保存')">保存设置</button></footer>

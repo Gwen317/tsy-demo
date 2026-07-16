@@ -247,6 +247,8 @@ async function requestXfyunVoiceprint(func, parameters = {}, payload) {
 }
 
 let xfyunGroupPromise
+const xfyunFeatureCache = new Map()
+const xfyunDeletedFeatureIds = new Set()
 
 function isXfyunEmptyGroupError(error) {
   return error instanceof Error && /groupId is empty|声纹库为空|特征库为空/i.test(error.message)
@@ -281,9 +283,15 @@ async function listXfyunFeatures() {
   await ensureXfyunGroup()
   try {
     const result = await requestXfyunVoiceprint('queryFeatureList', { groupId: XFYUN_VOICEPRINT_GROUP_ID })
-    return (Array.isArray(result) ? result : []).map(parseXfyunFeature)
+    const remoteFeatures = (Array.isArray(result) ? result : []).map(parseXfyunFeature)
+    remoteFeatures.forEach((feature) => {
+      if (xfyunDeletedFeatureIds.has(feature.feature_id)) return
+      const cached = xfyunFeatureCache.get(feature.feature_id)
+      if (!cached || feature.samples >= cached.samples) xfyunFeatureCache.set(feature.feature_id, feature)
+    })
+    return Array.from(xfyunFeatureCache.values())
   } catch (error) {
-    if (isXfyunEmptyGroupError(error)) return []
+    if (isXfyunEmptyGroupError(error)) return Array.from(xfyunFeatureCache.values())
     throw error
   }
 }
@@ -298,6 +306,8 @@ async function callXfyunVoiceprint(action, payload = {}) {
       groupId: XFYUN_VOICEPRINT_GROUP_ID,
       featureId: existing.feature_id,
     })
+    xfyunFeatureCache.delete(existing.feature_id)
+    xfyunDeletedFeatureIds.add(existing.feature_id)
     return { removed: true }
   }
   if (action === 'enroll') {
@@ -321,6 +331,13 @@ async function callXfyunVoiceprint(action, payload = {}) {
         featureInfo,
       }, audioPayload)
     }
+    xfyunDeletedFeatureIds.delete(featureId)
+    xfyunFeatureCache.set(featureId, {
+      staff_id: payload.staff_id,
+      name: payload.name,
+      samples,
+      feature_id: featureId,
+    })
     return { staff_id: payload.staff_id, name: payload.name, samples }
   }
   if (action === 'identify') {

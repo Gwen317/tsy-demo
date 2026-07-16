@@ -61,7 +61,10 @@ async function enroll() {
     message.value = '请保持正常坐姿，用日常窗口音量连续朗读。'
     const audio = await captureVoiceprintSample(8, (value) => { remaining.value = value })
     const result = await enrollVoiceprint(staffId.value.trim(), staffName.value.trim(), audio)
-    await loadStaff()
+    const existingIndex = staff.value.findIndex((item) => item.staff_id === result.staff_id)
+    if (existingIndex >= 0) staff.value[existingIndex] = result
+    else staff.value.push(result)
+    window.setTimeout(() => { void loadStaff() }, 1200)
     message.value = `${result.name} 录入成功，当前共有 ${result.samples} 个样本。`
   } catch (error) {
     message.value = explainError(error)
