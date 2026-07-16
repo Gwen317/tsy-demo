@@ -1,3 +1,5 @@
+import { identifyVoiceprint, joinAudioBuffers } from './voiceprint'
+
 export interface RecognitionResult {
   text: string
   final: boolean
@@ -5,6 +7,8 @@ export interface RecognitionResult {
   endTime: number
   speaker: 1 | 2
   speakerConfidence: number
+  staffName?: string
+  voiceprintMatched?: boolean
 }
 
 interface RecognitionCallbacks {
@@ -106,6 +110,7 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
   let stopped = false
   let ready = false
   let utteranceFeatures: VoiceSignature[] = []
+  let utteranceAudio: ArrayBuffer[] = []
   const clusters: VoiceCluster[] = []
 
   function assignSpeaker(): { speaker: 1 | 2; confidence: number } {
@@ -144,12 +149,13 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     const samples = downsample(event.inputBuffer.getChannelData(0), context.sampleRate)
     const feature = analyze(samples)
     if (feature) utteranceFeatures.push(feature)
+    if (feature) utteranceAudio.push(toPcm16(samples.slice()))
     callbacks.onLevel?.(Math.min(1, (feature?.rms || 0) * 9))
     socket.send(toPcm16(samples))
   }
 
   socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'start' })))
-  socket.addEventListener('message', (event) => {
+  socket.addEventListener('message', async (event) => {
     if (typeof event.data !== 'string') return
     let message: Record<string, unknown>
     try { message = JSON.parse(event.data) as Record<string, unknown> } catch { return }
@@ -159,7 +165,23 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     }
     if (message.type === 'result') {
       const final = Boolean(message.final)
-      const assignment = final ? assignSpeaker() : { speaker: 1 as const, confidence: 0.5 }
+      let assignment = final ? assignSpeaker() : { speaker: 1 as const, confidence: 0.5 }
+      let staffName: string | undefined
+      let voiceprintMatched = false
+      if (final && utteranceAudio.length) {
+        const audio = joinAudioBuffers(utteranceAudio)
+        utteranceAudio = []
+        try {
+          const match = await identifyVoiceprint(audio)
+          if (match.matched) {
+            assignment = { speaker: 2, confidence: match.score }
+            staffName = match.name || undefined
+            voiceprintMatched = true
+          }
+        } catch {
+          // Keep the session-level acoustic assignment when voiceprint matching is unavailable.
+        }
+      }
       callbacks.onResult?.({
         text: String(message.text || ''),
         final,
@@ -167,6 +189,8 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         endTime: Number(message.end_time || 0),
         speaker: assignment.speaker,
         speakerConfidence: assignment.confidence,
+        staffName,
+        voiceprintMatched,
       })
     }
     if (message.type === 'error') callbacks.onError?.(new Error(String(message.error || '实时识别失败。')))

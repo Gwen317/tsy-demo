@@ -1,9 +1,10 @@
 import { createServer as createHttpServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
+import Meyda from 'meyda'
 import WebSocket, { WebSocketServer } from 'ws'
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
@@ -22,6 +23,113 @@ const ASR_MODEL = process.env.ASR_MODEL || 'fun-asr-realtime'
 const TTS_URL = 'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer'
 const CHAT_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions'
 const REALTIME_TTS_URL = `wss://${WORKSPACE_ID}.${REGION}.maas.aliyuncs.com/api-ws/v1/inference`
+const VOICEPRINT_DIR = path.join(rootDir, '.voiceprint-data')
+const VOICEPRINT_FILE = path.join(VOICEPRINT_DIR, 'voiceprints.json')
+const VOICEPRINT_THRESHOLD = Number(process.env.VOICEPRINT_THRESHOLD || 0.97)
+const voiceprintReady = true
+Meyda.sampleRate = 16000
+Meyda.bufferSize = 512
+Meyda.numberOfMFCCCoefficients = 13
+
+async function loadVoiceprints() {
+  try { return JSON.parse(await readFile(VOICEPRINT_FILE, 'utf8')) } catch { return {} }
+}
+
+async function saveVoiceprints(database) {
+  await mkdir(VOICEPRINT_DIR, { recursive: true })
+  await writeFile(VOICEPRINT_FILE, JSON.stringify(database), 'utf8')
+}
+
+function normalizeVector(vector) {
+  const magnitude = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1
+  return vector.map((value) => value / magnitude)
+}
+
+function estimatePitch(frame) {
+  const mean = frame.reduce((sum, value) => sum + value, 0) / frame.length
+  let bestLag = 0
+  let bestCorrelation = 0
+  for (let lag = 40; lag <= 267; lag += 1) {
+    let correlation = 0
+    let leftEnergy = 0
+    let rightEnergy = 0
+    for (let index = 0; index < frame.length - lag; index += 1) {
+      const left = frame[index] - mean
+      const right = frame[index + lag] - mean
+      correlation += left * right
+      leftEnergy += left * left
+      rightEnergy += right * right
+    }
+    const normalized = correlation / (Math.sqrt(leftEnergy * rightEnergy) + 1e-8)
+    if (normalized > bestCorrelation) {
+      bestCorrelation = normalized
+      bestLag = lag
+    }
+  }
+  return {
+    pitch: bestCorrelation > 0.28 && bestLag ? 16000 / bestLag : 0,
+    periodicity: Math.max(0, bestCorrelation),
+  }
+}
+
+function extractVoiceprint(audio) {
+  if (audio.length < 32000) throw new Error('有效语音不足 1 秒。')
+  const samples = new Float32Array(Math.floor(audio.length / 2))
+  for (let i = 0; i < samples.length; i += 1) samples[i] = audio.readInt16LE(i * 2) / 32768
+  const features = []
+  for (let offset = 0; offset + 512 <= samples.length; offset += 256) {
+    const frame = samples.slice(offset, offset + 512)
+    const result = Meyda.extract(['mfcc', 'zcr', 'spectralCentroid', 'spectralRolloff', 'rms'], frame)
+    if (!result || result.rms < 0.005) continue
+    const pitch = estimatePitch(frame)
+    features.push([
+      ...result.mfcc.slice(1, 13).map((value) => value / 100),
+      result.zcr / 170,
+      result.spectralCentroid / 100,
+      result.spectralRolloff / 3000,
+      Math.log10(result.rms + 1e-5),
+      pitch.pitch / 120,
+      pitch.periodicity * 2,
+    ])
+  }
+  if (features.length < 8) throw new Error('去除静音后有效语音不足，请重新录入。')
+  const dimensions = features[0].length
+  const means = Array.from({ length: dimensions }, (_, index) => features.reduce((sum, feature) => sum + feature[index], 0) / features.length)
+  const deviations = Array.from({ length: dimensions }, (_, index) => Math.sqrt(features.reduce((sum, feature) => sum + (feature[index] - means[index]) ** 2, 0) / features.length))
+  return normalizeVector([...means, ...deviations])
+}
+
+function cosineSimilarity(left, right) {
+  return left.reduce((sum, value, index) => sum + value * (right[index] || 0), 0)
+}
+
+async function callVoiceprint(action, payload = {}) {
+  const database = await loadVoiceprints()
+  if (action === 'list') return { staff: Object.entries(database).map(([staffId, item]) => ({ staff_id: staffId, name: item.name, samples: item.samples })) }
+  if (action === 'delete') {
+    const removed = Boolean(database[payload.staff_id])
+    delete database[payload.staff_id]
+    await saveVoiceprints(database)
+    return { removed }
+  }
+  const embedding = extractVoiceprint(Buffer.from(payload.audio, 'base64'))
+  if (action === 'enroll') {
+    if (!payload.staff_id || !payload.name) throw new Error('员工编号和姓名不能为空。')
+    const existing = database[payload.staff_id]
+    const samples = existing ? existing.samples + 1 : 1
+    const merged = existing ? normalizeVector(existing.embedding.map((value, index) => (value * existing.samples + embedding[index]) / samples)) : embedding
+    database[payload.staff_id] = { name: payload.name, samples, embedding: merged }
+    await saveVoiceprints(database)
+    return { staff_id: payload.staff_id, name: payload.name, samples }
+  }
+  if (action === 'identify') {
+    const candidates = Object.entries(database).map(([staffId, item]) => ({ staffId, item, score: cosineSimilarity(embedding, item.embedding) })).sort((a, b) => b.score - a.score)
+    if (!candidates.length) return { matched: false, score: 0, reason: 'VOICEPRINT_DATABASE_EMPTY' }
+    const best = candidates[0]
+    return { matched: best.score >= VOICEPRINT_THRESHOLD, staff_id: best.score >= VOICEPRINT_THRESHOLD ? best.staffId : null, name: best.score >= VOICEPRINT_THRESHOLD ? best.item.name : null, score: Number(best.score.toFixed(4)), threshold: VOICEPRINT_THRESHOLD }
+  }
+  throw new Error('未知的声纹操作。')
+}
 
 const voiceProfiles = {
   粤语: { voice: 'longjiayi_v3', name: '龙嘉怡', instruction: '', trait: '知性粤语女' },
@@ -66,6 +174,17 @@ async function readJson(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+async function readBuffer(req, maxBytes = 2 * 1024 * 1024) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > maxBytes) throw new Error('AUDIO_TOO_LARGE')
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks)
 }
 
 function pickAudioUrl(data) {
@@ -525,7 +644,8 @@ async function main() {
         workspace_id: WORKSPACE_ID,
         region: REGION,
         voice_profiles: voiceProfiles,
-        capabilities: ['cosyvoice-streaming-tts', 'fun-asr-realtime', 'two-speaker-acoustic-clustering', 'qwen-dialect-rewrite', 'qwen-live-assist'],
+        capabilities: ['cosyvoice-streaming-tts', 'fun-asr-realtime', 'voiceprint-identification', 'two-speaker-acoustic-clustering', 'qwen-dialect-rewrite', 'qwen-live-assist'],
+        voiceprint_ready: voiceprintReady,
       })
       return
     }
@@ -551,6 +671,43 @@ async function main() {
       handleAssist(req, res).catch((error) => {
         sendJson(res, 502, { error: '无法连接阿里云会话辅助服务。', code: 'ALIYUN_NETWORK_ERROR', message: error.message })
       })
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/voiceprints') {
+      callVoiceprint('list').then((result) => sendJson(res, 200, { ready: true, ...result })).catch((error) => sendJson(res, 503, { ready: false, error: error.message }))
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/voiceprints/enroll') {
+      try {
+        const audio = await readBuffer(req)
+        const result = await callVoiceprint('enroll', {
+          staff_id: String(req.headers['x-staff-id'] || ''),
+          name: decodeURIComponent(String(req.headers['x-staff-name'] || '')),
+          audio: audio.toString('base64'),
+        })
+        sendJson(res, 200, result)
+      } catch (error) {
+        sendJson(res, error.message === 'AUDIO_TOO_LARGE' ? 413 : 400, { error: error.message })
+      }
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/voiceprints/identify') {
+      try {
+        const audio = await readBuffer(req)
+        const result = await callVoiceprint('identify', { audio: audio.toString('base64') })
+        sendJson(res, 200, result)
+      } catch (error) {
+        sendJson(res, error.message === 'AUDIO_TOO_LARGE' ? 413 : 400, { error: error.message })
+      }
+      return
+    }
+    if (req.method === 'DELETE' && url.pathname.startsWith('/api/voiceprints/')) {
+      try {
+        const result = await callVoiceprint('delete', { staff_id: decodeURIComponent(url.pathname.slice('/api/voiceprints/'.length)) })
+        sendJson(res, 200, result)
+      } catch (error) {
+        sendJson(res, 400, { error: error.message })
+      }
       return
     }
 

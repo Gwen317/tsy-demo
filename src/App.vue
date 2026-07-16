@@ -9,6 +9,7 @@ import {
   Cloud,
   Clock3,
   FileText,
+  Fingerprint,
   Globe2,
   House,
   Info,
@@ -25,12 +26,14 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  Trash2,
   UserRound,
   Volume2,
   X,
 } from 'lucide-vue-next'
 import { generateConversationAssist, getAliyunConfig, rewriteDialect, streamSpeech, synthesizeSpeech, translateToMandarin, type AliyunConfig } from './services/aliyun'
 import { startRealtimeRecognition } from './services/realtime-asr'
+import { captureVoiceprintSample, deleteVoiceprint, enrollVoiceprint, listVoiceprints, type VoiceprintStaff } from './services/voiceprint'
 
 type View = 'welcome' | 'session'
 type SessionStatus = 'live' | 'archived'
@@ -44,6 +47,8 @@ interface TranscriptMessage {
   translation: string
   time: number
   speakerConfidence?: number
+  staffName?: string
+  voiceprintMatched?: boolean
 }
 
 interface Conversation {
@@ -86,6 +91,14 @@ const aliyunLoading = ref(false)
 const toast = ref('')
 const interimText = ref('')
 const micLevel = ref(0)
+const voiceprintStaff = ref<VoiceprintStaff[]>([])
+const voiceprintReady = ref(false)
+const voiceprintLoading = ref(false)
+const voiceprintRecording = ref(false)
+const voiceprintRemaining = ref(0)
+const voiceprintConsent = ref(false)
+const voiceprintStaffId = ref('ZY-0186')
+const voiceprintStaffName = ref('窗口工作人员')
 const transcriptList = ref<HTMLElement | null>(null)
 const dialectOptions = ['粤语', '四川话', '闽南语', '东北话', '河南话', '陕西话', '山东话', '湖南话', '安徽话']
 let clockTimer: number | undefined
@@ -247,6 +260,8 @@ async function beginRecognition() {
           text: result.text.trim(),
           translation: '正在转换为普通话...',
           speakerConfidence: result.speakerConfidence,
+          staffName: result.staffName,
+          voiceprintMatched: result.voiceprintMatched,
         })
         if (!message) return
         if (activeConversation.value.messages.length === 1) {
@@ -351,7 +366,53 @@ async function endSession() {
 function swapSpeaker(message: TranscriptMessage) {
   message.speaker = message.speaker === 1 ? 2 : 1
   message.language = message.speaker === 1 ? dialect.value : '普通话'
+  message.voiceprintMatched = false
+  message.staffName = undefined
   showToast(`已调整为发言人 ${message.speaker}`)
+}
+
+async function loadVoiceprints() {
+  try {
+    const result = await listVoiceprints()
+    voiceprintReady.value = result.ready
+    voiceprintStaff.value = result.staff
+  } catch {
+    voiceprintReady.value = false
+    voiceprintStaff.value = []
+  }
+}
+
+async function recordVoiceprint() {
+  if (!voiceprintConsent.value || !voiceprintStaffId.value.trim() || !voiceprintStaffName.value.trim() || voiceprintRecording.value) return
+  try {
+    voiceprintRecording.value = true
+    voiceprintRemaining.value = 8
+    showToast('请用正常音量连续朗读窗口服务用语')
+    const pcm = await captureVoiceprintSample(8, (remaining) => { voiceprintRemaining.value = remaining })
+    voiceprintLoading.value = true
+    const result = await enrollVoiceprint(voiceprintStaffId.value.trim(), voiceprintStaffName.value.trim(), pcm)
+    await loadVoiceprints()
+    showToast(`声纹录入成功 · 已有 ${result.samples} 个样本`)
+  } catch (error) {
+    showToast(error instanceof DOMException && error.name === 'NotAllowedError' ? '需要允许麦克风权限才能录入声纹' : error instanceof Error ? error.message : '声纹录入失败')
+  } finally {
+    voiceprintRecording.value = false
+    voiceprintLoading.value = false
+    voiceprintRemaining.value = 0
+  }
+}
+
+async function removeVoiceprint(staffId: string) {
+  try {
+    voiceprintLoading.value = true
+    await deleteVoiceprint(staffId)
+    await loadVoiceprints()
+    showToast('工作人员声纹已删除')
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '删除声纹失败')
+  } finally {
+    voiceprintLoading.value = false
+  }
 }
 
 function refreshSuggestion() {
@@ -508,6 +569,7 @@ watch(conversations, (value) => {
 
 onMounted(() => {
   void loadAliyunConfig()
+  void loadVoiceprints()
   const saved = localStorage.getItem(STORAGE_KEY)
   if (saved) {
     try {
@@ -610,8 +672,8 @@ onBeforeUnmount(() => {
               <div v-if="interimText" class="interim-card"><span class="interim-dot"></span><div><strong>识别中</strong><p>{{ interimText }}</p></div></div>
               <article v-for="message in messages" :key="message.id" class="speaker-card" :class="message.speaker === 1 ? 'speaker-one' : 'speaker-two'">
                 <div class="speaker-meta">
-                  <span class="speaker-avatar"><UserRound :size="23" /></span><strong>{{ message.speaker === 1 ? '办事群众' : '窗口人员' }}</strong><em>{{ message.language }}</em>
-                  <small v-if="message.speakerConfidence" class="speaker-confidence">分离 {{ Math.round(message.speakerConfidence * 100) }}%</small>
+                  <span class="speaker-avatar"><Fingerprint v-if="message.voiceprintMatched" :size="22" /><UserRound v-else :size="23" /></span><strong>{{ message.speaker === 1 ? '办事群众' : message.staffName || '窗口人员' }}</strong><em>{{ message.language }}</em>
+                  <small v-if="message.speakerConfidence" class="speaker-confidence" :class="{ matched: message.voiceprintMatched }">{{ message.voiceprintMatched ? '声纹匹配' : '分离' }} {{ Math.round(message.speakerConfidence * 100) }}%</small>
                   <button class="swap-speaker" title="交换说话人" aria-label="交换说话人" @click="swapSpeaker(message)"><ArrowLeftRight :size="16" /></button>
                   <button class="play-audio" :class="{ playing: playingMessageId === message.id }" :aria-label="playingMessageId === message.id ? '停止播放' : '播放发言'" @click="speakMessage(message)"><Volume2 :size="20" /></button>
                   <div class="audio-line" :class="{ active: playingMessageId === message.id || (isListening && message.id === messages[messages.length - 1]?.id) }"><i v-for="n in 50" :key="n" :style="{ height: `${5 + (n * (message.speaker === 1 ? 11 : 13)) % 19}px` }"></i></div>
@@ -660,6 +722,13 @@ onBeforeUnmount(() => {
           <span><strong>阿里云百炼 CosyVoice</strong><small>{{ aliyunConfig?.configured ? `${currentVoiceProfile?.name || '系统音色'} · ${currentVoiceProfile?.trait || '流式语音'}` : '等待配置 DASHSCOPE_API_KEY' }}</small></span>
           <em>{{ aliyunConfig?.configured ? '流式' : '未连接' }}</em>
         </div>
+        <section class="voiceprint-panel">
+          <div class="voiceprint-heading"><span class="provider-icon"><Fingerprint :size="21" /></span><span><strong>工作人员声纹</strong><small>{{ voiceprintReady ? voiceprintStaff.length ? `已登记 ${voiceprintStaff.length} 位工作人员` : '模型就绪，等待录入' : '声纹模型未就绪' }}</small></span></div>
+          <div class="voiceprint-fields"><label><span>工号</span><input v-model="voiceprintStaffId" :disabled="voiceprintRecording" /></label><label><span>姓名</span><input v-model="voiceprintStaffName" :disabled="voiceprintRecording" /></label></div>
+          <label class="voiceprint-consent"><input v-model="voiceprintConsent" type="checkbox" :disabled="voiceprintRecording" /><span>已取得工作人员本人授权，仅保存声纹向量</span></label>
+          <button class="enroll-voiceprint" :class="{ recording: voiceprintRecording }" :disabled="!voiceprintReady || !voiceprintConsent || voiceprintLoading || isListening" @click="recordVoiceprint"><MicOff v-if="voiceprintRecording" :size="18" /><Fingerprint v-else :size="18" />{{ voiceprintRecording ? `录入中 · ${voiceprintRemaining} 秒` : isListening ? '请先暂停实时收音' : '录入 8 秒声纹样本' }}</button>
+          <div v-if="voiceprintStaff.length" class="voiceprint-list"><div v-for="staff in voiceprintStaff" :key="staff.staff_id"><span><strong>{{ staff.name }}</strong><small>{{ staff.staff_id }} · {{ staff.samples }} 个样本</small></span><button title="删除声纹" :disabled="voiceprintLoading" @click="removeVoiceprint(staff.staff_id)"><Trash2 :size="16" /></button></div></div>
+        </section>
         <footer><button class="reset-button" @click="resetDemo"><RotateCcw :size="17" /> 重置演示数据</button><button class="save-button" @click="settingsOpen = false; showToast('设置已保存')">保存设置</button></footer>
       </section>
     </div>
