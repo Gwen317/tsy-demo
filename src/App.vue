@@ -31,8 +31,8 @@ import {
   Volume2,
   X,
 } from 'lucide-vue-next'
-import { generateConversationAssist, getAliyunConfig, rewriteDialect, streamSpeech, synthesizeSpeech, translateToMandarin, type AliyunConfig } from './services/aliyun'
-import { startRealtimeRecognition } from './services/realtime-asr'
+import { generateConversationAssist, getAliyunConfig, rewriteDialect, streamSpeech, streamTranslateToMandarin, synthesizeSpeech, translateToMandarin, type AliyunConfig } from './services/aliyun'
+import { startRealtimeRecognition, type RecognitionResult } from './services/realtime-asr'
 import { captureVoiceprintSample, deleteVoiceprint, enrollVoiceprint, listVoiceprints, type VoiceprintStaff } from './services/voiceprint'
 
 type View = 'welcome' | 'session'
@@ -49,6 +49,7 @@ interface TranscriptMessage {
   speakerConfidence?: number
   staffName?: string
   voiceprintMatched?: boolean
+  translationStreaming?: boolean
 }
 
 interface Conversation {
@@ -90,6 +91,8 @@ const aliyunConfig = ref<AliyunConfig | null>(null)
 const aliyunLoading = ref(false)
 const toast = ref('')
 const interimText = ref('')
+const interimSpeaker = ref<Speaker>(1)
+const interimSpeakerConfidence = ref(0.5)
 const micLevel = ref(0)
 const voiceprintStaff = ref<VoiceprintStaff[]>([])
 const voiceprintReady = ref(false)
@@ -110,6 +113,7 @@ let messageSequence = 20
 let audioPlayer: HTMLAudioElement | null = null
 let stopStreamingAudio: (() => void) | null = null
 let stopRecognition: (() => Promise<void>) | null = null
+const recognitionMessages = new Map<string, TranscriptMessage>()
 
 const seedConversations: Conversation[] = [
   {
@@ -238,13 +242,53 @@ function addMessage(message: Omit<TranscriptMessage, 'id' | 'time'>) {
   if (!activeConversation.value) return null
   const nextMessage = { ...message, id: ++messageSequence, time: elapsed.value }
   activeConversation.value.messages.push(nextMessage)
-  nextTick(() => transcriptList.value?.scrollTo({ top: transcriptList.value.scrollHeight, behavior: 'smooth' }))
+  scrollTranscriptToBottom()
   return nextMessage
+}
+
+function scrollTranscriptToBottom() {
+  void nextTick(() => {
+    if (transcriptList.value) transcriptList.value.scrollTop = transcriptList.value.scrollHeight
+  })
+}
+
+function recognitionKey(result: Pick<RecognitionResult, 'beginTime' | 'endTime' | 'text'>) {
+  return `${result.beginTime}:${result.endTime}:${result.text}`
+}
+
+async function translateMessage(message: TranscriptMessage) {
+  if (!translating.value) {
+    message.translation = message.text
+    message.translationStreaming = false
+    scheduleConversationAssist()
+    return
+  }
+  message.translationStreaming = true
+  try {
+    const translated = await streamTranslateToMandarin(message.text, (partial) => {
+      message.translation = partial
+      scrollTranscriptToBottom()
+    })
+    message.translation = translated || message.text
+  } catch {
+    try {
+      const translated = await translateToMandarin(message.text)
+      message.translation = translated.text || message.text
+    } catch {
+      message.translation = message.text
+    }
+  } finally {
+    message.translationStreaming = false
+    scheduleConversationAssist()
+  }
 }
 
 async function beginRecognition() {
   if (stopRecognition) return
   interimText.value = ''
+  interimSpeaker.value = 1
+  interimSpeakerConfidence.value = 0.5
+  recognitionMessages.clear()
   try {
     stopRecognition = await startRealtimeRecognition({
       onReady: () => {
@@ -253,32 +297,50 @@ async function beginRecognition() {
       },
       onLevel: (level) => { micLevel.value = level },
       onResult: (result) => {
-        interimText.value = result.final ? '' : result.text
-        if (!result.final || !result.text.trim()) return
+        if (!result.final) {
+          interimText.value = result.text
+          interimSpeaker.value = result.speaker
+          interimSpeakerConfidence.value = result.speakerConfidence
+          scrollTranscriptToBottom()
+          return
+        }
+        interimText.value = ''
+        if (!result.text.trim()) return
         const message = addMessage({
           speaker: result.speaker,
           language: result.speaker === 1 ? dialect.value : '普通话',
           text: result.text.trim(),
-          translation: '正在转换为普通话...',
+          translation: '',
           speakerConfidence: result.speakerConfidence,
           staffName: result.staffName,
           voiceprintMatched: result.voiceprintMatched,
+          translationStreaming: translating.value,
         })
         if (!message) return
+        recognitionMessages.set(recognitionKey(result), message)
         if (activeConversation.value.messages.length === 1) {
           activeConversation.value.title = `${result.text.trim().slice(0, 10)}${result.text.trim().length > 10 ? '…' : ''}`
           activeConversation.value.meta = `刚刚 · ${service.value}`
         }
-        void translateToMandarin(result.text).then((translated) => {
-          message.translation = translated.text || result.text
-        }).catch(() => { message.translation = result.text }).finally(() => scheduleConversationAssist())
+        void translateMessage(message)
+      },
+      onSpeakerResolved: (result) => {
+        const message = recognitionMessages.get(recognitionKey(result))
+        if (!message) return
+        message.speaker = result.speaker
+        message.language = result.speaker === 1 ? dialect.value : '普通话'
+        message.speakerConfidence = result.speakerConfidence
+        message.staffName = result.staffName
+        message.voiceprintMatched = result.voiceprintMatched
       },
       onError: (error) => {
         isListening.value = false
+        interimText.value = ''
         showToast(error.message)
       },
       onClose: () => {
         isListening.value = false
+        interimText.value = ''
         stopRecognition = null
       },
     })
@@ -296,6 +358,7 @@ async function stopLiveRecognition() {
   isListening.value = false
   micLevel.value = 0
   interimText.value = ''
+  recognitionMessages.clear()
 }
 
 async function createNewSession() {
@@ -675,18 +738,28 @@ onBeforeUnmount(() => {
 
             <div ref="transcriptList" class="messages-list">
               <div v-if="messages.length === 0 && !interimText" class="listening-empty"><span class="listening-ring"><Mic :size="28" /></span><strong>{{ isListening ? '正在聆听' : '麦克风已暂停' }}</strong><p>{{ isListening ? '请两位依次说话，系统将自动识别并分离说话人' : '点击继续恢复实时识别' }}</p></div>
-              <div v-if="interimText" class="interim-card"><span class="interim-dot"></span><div><strong>识别中</strong><p>{{ interimText }}</p></div></div>
               <article v-for="message in messages" :key="message.id" class="speaker-card" :class="message.speaker === 1 ? 'speaker-one' : 'speaker-two'">
                 <div class="speaker-meta">
                   <span class="speaker-avatar"><Fingerprint v-if="message.voiceprintMatched" :size="22" /><UserRound v-else :size="23" /></span><strong>{{ message.speaker === 1 ? '办事群众' : message.staffName || '窗口人员' }}</strong><em>{{ message.language }}</em>
                   <small v-if="message.speakerConfidence" class="speaker-confidence" :class="{ matched: message.voiceprintMatched }">{{ message.voiceprintMatched ? '声纹匹配' : '分离' }} {{ Math.round(message.speakerConfidence * 100) }}%</small>
+                  <span class="sentence-status"><CheckCircle2 :size="13" />已断句</span>
                   <button class="swap-speaker" title="交换说话人" aria-label="交换说话人" @click="swapSpeaker(message)"><ArrowLeftRight :size="16" /></button>
                   <button class="play-audio" :class="{ playing: playingMessageId === message.id }" :aria-label="playingMessageId === message.id ? '停止播放' : '播放发言'" @click="speakMessage(message)"><Volume2 :size="20" /></button>
                   <div class="audio-line" :class="{ active: playingMessageId === message.id || (isListening && message.id === messages[messages.length - 1]?.id) }"><i v-for="n in 50" :key="n" :style="{ height: `${5 + (n * (message.speaker === 1 ? 11 : 13)) % 19}px` }"></i></div>
                   <time>{{ formatTime(message.time) }}</time>
                 </div>
                 <p class="spoken">{{ message.text }}</p>
-                <div v-if="translating" class="translation"><b>普通话整理</b><span>{{ message.translation }}</span></div>
+                <div v-if="translating" class="translation" :class="{ streaming: message.translationStreaming }"><b>普通话整理 <small v-if="message.translationStreaming"><i></i>流式生成中</small></b><span>{{ message.translation || '正在接收转换结果…' }}</span></div>
+              </article>
+              <article v-if="interimText" class="speaker-card live-draft" :class="interimSpeaker === 1 ? 'speaker-one' : 'speaker-two'">
+                <div class="speaker-meta">
+                  <span class="speaker-avatar"><UserRound :size="23" /></span><strong>{{ interimSpeaker === 1 ? '办事群众' : '窗口人员' }}</strong><em>{{ interimSpeaker === 1 ? dialect : '普通话' }}</em>
+                  <small class="speaker-confidence">预判 {{ Math.round(interimSpeakerConfidence * 100) }}%</small>
+                  <span class="sentence-status pending"><i></i>识别中 · 等待断句</span>
+                  <div class="audio-line active"><i v-for="n in 50" :key="n" :style="{ height: `${5 + (n * (interimSpeaker === 1 ? 11 : 13)) % 19}px` }"></i></div>
+                  <time>实时</time>
+                </div>
+                <p class="spoken">{{ interimText }}</p>
               </article>
             </div>
 

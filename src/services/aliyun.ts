@@ -161,6 +161,39 @@ export function translateToMandarin(text: string) {
   })
 }
 
+export async function streamTranslateToMandarin(text: string, onUpdate: (text: string) => void) {
+  const response = await fetch('/api/aliyun/translate-stream', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(data.error || '流式翻译请求失败。')
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  let translated = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    pending += decoder.decode(value, { stream: !done })
+    const lines = pending.split(/\r?\n/)
+    pending = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.trim()) continue
+      const event = JSON.parse(line) as { delta?: string; error?: string }
+      if (event.error) throw new Error(event.error)
+      if (event.delta) {
+        translated += event.delta
+        onUpdate(translated)
+      }
+    }
+    if (done) break
+  }
+  return translated.trim()
+}
+
 export function generateConversationAssist(
   messages: Array<{ speaker: number; text: string; translation: string }>,
   service: string,

@@ -586,6 +586,68 @@ async function handleTranslate(req, res) {
   sendJson(res, 200, { text: data?.choices?.[0]?.message?.content?.trim() || text })
 }
 
+async function handleTranslateStream(req, res) {
+  if (!API_KEY) {
+    sendJson(res, 503, { error: '阿里云百炼 API Key 尚未配置。', code: 'ALIYUN_NOT_CONFIGURED' })
+    return
+  }
+  let body
+  try {
+    body = await readJson(req)
+  } catch {
+    sendJson(res, 400, { error: '请求内容不是有效 JSON。' })
+    return
+  }
+  const text = String(body.text || '').trim()
+  if (!text) {
+    sendJson(res, 400, { error: '翻译文本不能为空。' })
+    return
+  }
+  const upstream = await fetch(CHAT_URL, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: REWRITE_MODEL,
+      stream: true,
+      messages: [
+        { role: 'system', content: '将用户的方言口语准确转换为简洁自然的普通话。只输出转换结果，不解释，不添加引号。若原文已经是普通话，保持原意并仅修正明显错字。' },
+        { role: 'user', content: text.slice(0, 2000) },
+      ],
+      temperature: 0.1,
+    }),
+  })
+  if (!upstream.ok || !upstream.body) {
+    const data = await upstream.json().catch(() => null)
+    sendJson(res, upstream.status || 502, { error: '阿里云流式翻译失败。', message: data?.message || '' })
+    return
+  }
+  res.writeHead(200, {
+    'content-type': 'application/x-ndjson; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+  })
+  const decoder = new TextDecoder()
+  let pending = ''
+  for await (const chunk of upstream.body) {
+    pending += decoder.decode(chunk, { stream: true })
+    const lines = pending.split(/\r?\n/)
+    pending = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+      try {
+        const event = JSON.parse(payload)
+        const delta = event?.choices?.[0]?.delta?.content || ''
+        if (delta) res.write(`${JSON.stringify({ delta })}\n`)
+      } catch {
+        // Ignore malformed upstream heartbeat lines.
+      }
+    }
+  }
+  res.end(`${JSON.stringify({ done: true })}\n`)
+}
+
 async function handleAssist(req, res) {
   if (!API_KEY) {
     sendJson(res, 503, { error: '阿里云百炼 API Key 尚未配置。', code: 'ALIYUN_NOT_CONFIGURED' })
@@ -905,6 +967,13 @@ async function main() {
     if (req.method === 'POST' && url.pathname === '/api/aliyun/translate') {
       handleTranslate(req, res).catch((error) => {
         sendJson(res, 502, { error: '无法连接阿里云翻译服务。', code: 'ALIYUN_NETWORK_ERROR', message: error.message })
+      })
+      return
+    }
+    if (req.method === 'POST' && url.pathname === '/api/aliyun/translate-stream') {
+      handleTranslateStream(req, res).catch((error) => {
+        if (!res.headersSent) sendJson(res, 502, { error: '无法连接阿里云流式翻译服务。', code: 'ALIYUN_NETWORK_ERROR', message: error.message })
+        else res.end(`${JSON.stringify({ error: error.message })}\n`)
       })
       return
     }

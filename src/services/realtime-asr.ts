@@ -14,6 +14,7 @@ export interface RecognitionResult {
 interface RecognitionCallbacks {
   onReady?: () => void
   onResult?: (result: RecognitionResult) => void
+  onSpeakerResolved?: (result: RecognitionResult) => void
   onLevel?: (level: number) => void
   onError?: (error: Error) => void
   onClose?: () => void
@@ -122,14 +123,33 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
     return Date.now() - lastFinalAt < 1200
   }
 
-  function assignSpeaker(): { speaker: 1 | 2; confidence: number } {
-    if (!utteranceFeatures.length) return { speaker: 1, confidence: 0.5 }
-    const signature = utteranceFeatures.reduce<VoiceSignature>((sum, item) => ({
+  function averageSignature() {
+    if (!utteranceFeatures.length) return null
+    return utteranceFeatures.reduce<VoiceSignature>((sum, item) => ({
       rms: sum.rms + item.rms / utteranceFeatures.length,
       zeroCrossing: sum.zeroCrossing + item.zeroCrossing / utteranceFeatures.length,
       brightness: sum.brightness + item.brightness / utteranceFeatures.length,
     }), { rms: 0, zeroCrossing: 0, brightness: 0 })
+  }
+
+  function previewSpeaker(): { speaker: 1 | 2; confidence: number } {
+    const signature = averageSignature()
+    if (!signature || !clusters.length) return { speaker: 1, confidence: signature ? 0.7 : 0.5 }
+    const distances = clusters.map((cluster) => distance(signature, cluster))
+    if (clusters.length === 1 && distances[0] > 0.42) {
+      return { speaker: 2, confidence: Math.min(0.9, 0.6 + distances[0] * 0.22) }
+    }
+    const index = distances[0] <= (distances[1] ?? Number.POSITIVE_INFINITY) ? 0 : 1
+    const nearest = distances[index]
+    const other = distances[index === 0 ? 1 : 0]
+    const confidence = other === undefined ? 0.64 : Math.min(0.94, 0.56 + Math.max(0, other - nearest) * 0.5)
+    return { speaker: (index + 1) as 1 | 2, confidence }
+  }
+
+  function assignSpeaker(): { speaker: 1 | 2; confidence: number } {
+    const signature = averageSignature()
     utteranceFeatures = []
+    if (!signature) return { speaker: 1, confidence: 0.5 }
 
     if (!clusters.length) {
       clusters.push({ ...signature, samples: 1 })
@@ -183,33 +203,35 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         lastFinalEndTime = endTime
         lastFinalAt = Date.now()
       }
-      let assignment = final ? assignSpeaker() : { speaker: 1 as const, confidence: 0.5 }
-      let staffName: string | undefined
-      let voiceprintMatched = false
-      if (final && utteranceAudio.length) {
-        const audio = joinAudioBuffers(utteranceAudio)
-        utteranceAudio = []
-        try {
-          const match = await identifyVoiceprint(audio)
-          if (match.matched) {
-            assignment = { speaker: 2, confidence: match.confidence ?? match.score }
-            staffName = match.name || undefined
-            voiceprintMatched = true
-          }
-        } catch {
-          // Keep the session-level acoustic assignment when voiceprint matching is unavailable.
-        }
-      }
-      callbacks.onResult?.({
+      const assignment = final ? assignSpeaker() : previewSpeaker()
+      const result: RecognitionResult = {
         text,
         final,
         beginTime: Number(message.begin_time || 0),
         endTime,
         speaker: assignment.speaker,
         speakerConfidence: assignment.confidence,
-        staffName,
-        voiceprintMatched,
-      })
+      }
+      callbacks.onResult?.(result)
+
+      if (final) {
+        const audio = utteranceAudio.length ? joinAudioBuffers(utteranceAudio) : null
+        utteranceAudio = []
+        if (audio) {
+          void identifyVoiceprint(audio).then((match) => {
+            if (!match.matched || stopped) return
+            callbacks.onSpeakerResolved?.({
+              ...result,
+              speaker: 2,
+              speakerConfidence: match.confidence ?? match.score,
+              staffName: match.name || undefined,
+              voiceprintMatched: true,
+            })
+          }).catch(() => {
+            // The acoustic speaker assignment remains usable while the online match is unavailable.
+          })
+        }
+      }
     }
     if (message.type === 'error') callbacks.onError?.(new Error(String(message.error || '实时识别失败。')))
   })
