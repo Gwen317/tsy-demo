@@ -18,7 +18,7 @@ interface TestRecord {
 const staff = ref<VoiceprintStaff[]>([])
 const ready = ref(false)
 const provider = ref<'local' | 'xfyun'>('local')
-const threshold = ref(0.99)
+const threshold = ref(0.6)
 const loading = ref(false)
 const mode = ref<'idle' | 'enroll' | 'identify'>('idle')
 const remaining = ref(0)
