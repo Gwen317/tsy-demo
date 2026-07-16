@@ -47,8 +47,11 @@ interface TranscriptMessage {
   translation: string
   time: number
   speakerConfidence?: number
+  acousticSpeaker?: Speaker
   staffName?: string
   voiceprintMatched?: boolean
+  identityResolved?: boolean
+  identitySource?: 'voiceprint' | 'session' | 'unmatched' | 'manual'
   translationStreaming?: boolean
 }
 
@@ -258,6 +261,27 @@ function recognitionKey(result: Pick<RecognitionResult, 'beginTime' | 'endTime' 
   return `${result.beginTime}:${result.endTime}:${result.text}`
 }
 
+function isIdentityUnconfirmed(message: TranscriptMessage) {
+  return message.identityResolved === false
+    || (message.identityResolved === undefined && !message.identitySource && !message.voiceprintMatched)
+}
+
+function speakerLabel(message: TranscriptMessage) {
+  if (isIdentityUnconfirmed(message)) return `发言人 ${message.acousticSpeaker || message.speaker}`
+  return message.speaker === 2 ? message.staffName || '窗口人员' : '办事群众'
+}
+
+function identityLabel(message: TranscriptMessage) {
+  const confidence = message.speakerConfidence ? ` ${Math.round(message.speakerConfidence * 100)}%` : ''
+  if (message.identityResolved === false) return '身份确认中'
+  if (message.identityResolved === undefined && !message.identitySource && !message.voiceprintMatched) return '历史身份未确认'
+  if (message.identitySource === 'voiceprint') return `声纹匹配${confidence}`
+  if (message.identitySource === 'session') return `会话关联${confidence}`
+  if (message.identitySource === 'unmatched') return `群众 · 分离${confidence}`
+  if (message.identitySource === 'manual') return '人工调整'
+  return `${message.voiceprintMatched ? '声纹匹配' : '分离'}${confidence}`
+}
+
 async function translateMessage(message: TranscriptMessage) {
   if (!translating.value) {
     message.translation = message.text
@@ -314,8 +338,11 @@ async function beginRecognition() {
           text: result.text.trim(),
           translation: '',
           speakerConfidence: result.speakerConfidence,
+          acousticSpeaker: result.acousticSpeaker,
           staffName: result.staffName,
           voiceprintMatched: result.voiceprintMatched,
+          identityResolved: result.identityResolved,
+          identitySource: result.identitySource,
           translationStreaming: translating.value,
         })
         if (!message) return
@@ -332,8 +359,12 @@ async function beginRecognition() {
         message.speaker = result.speaker
         message.language = result.speaker === 1 ? dialect.value : '普通话'
         message.speakerConfidence = result.speakerConfidence
+        message.acousticSpeaker = result.acousticSpeaker
         message.staffName = result.staffName
         message.voiceprintMatched = result.voiceprintMatched
+        message.identityResolved = result.identityResolved
+        message.identitySource = result.identitySource
+        scheduleConversationAssist(200)
       },
       onError: (error) => {
         isListening.value = false
@@ -433,6 +464,8 @@ function swapSpeaker(message: TranscriptMessage) {
   message.speaker = message.speaker === 1 ? 2 : 1
   message.language = message.speaker === 1 ? dialect.value : '普通话'
   message.voiceprintMatched = false
+  message.identityResolved = true
+  message.identitySource = 'manual'
   message.staffName = undefined
   showToast(`已调整为发言人 ${message.speaker}`)
 }
@@ -749,8 +782,8 @@ onBeforeUnmount(() => {
               <div v-if="messages.length === 0 && !interimText" class="listening-empty"><span class="listening-ring"><Mic :size="28" /></span><strong>{{ isListening ? '正在聆听' : '麦克风已暂停' }}</strong><p>{{ isListening ? '请两位依次说话，系统将自动识别并分离说话人' : '点击继续恢复实时识别' }}</p></div>
               <article v-for="message in messages" :key="message.id" class="speaker-card" :class="message.speaker === 1 ? 'speaker-one' : 'speaker-two'">
                 <div class="speaker-meta">
-                  <span class="speaker-avatar"><Fingerprint v-if="message.voiceprintMatched" :size="22" /><UserRound v-else :size="23" /></span><strong>{{ message.speaker === 1 ? '办事群众' : message.staffName || '窗口人员' }}</strong><em>{{ message.language }}</em>
-                  <small v-if="message.speakerConfidence" class="speaker-confidence" :class="{ matched: message.voiceprintMatched }">{{ message.voiceprintMatched ? '声纹匹配' : '分离' }} {{ Math.round(message.speakerConfidence * 100) }}%</small>
+                  <span class="speaker-avatar"><Fingerprint v-if="message.identitySource === 'voiceprint' || message.identitySource === 'session' || message.voiceprintMatched" :size="22" /><UserRound v-else :size="23" /></span><strong>{{ speakerLabel(message) }}</strong><em>{{ message.language }}</em>
+                  <small class="speaker-confidence" :class="{ matched: message.identitySource === 'voiceprint' || message.identitySource === 'session' || message.voiceprintMatched, pending: isIdentityUnconfirmed(message) }">{{ identityLabel(message) }}</small>
                   <span class="sentence-status"><CheckCircle2 :size="13" />已断句</span>
                   <button class="swap-speaker" title="交换说话人" aria-label="交换说话人" @click="swapSpeaker(message)"><ArrowLeftRight :size="16" /></button>
                   <button class="play-audio" :class="{ playing: playingMessageId === message.id }" :aria-label="playingMessageId === message.id ? '停止播放' : '播放发言'" @click="speakMessage(message)"><Volume2 :size="20" /></button>
@@ -762,7 +795,7 @@ onBeforeUnmount(() => {
               </article>
               <article v-if="interimText" class="speaker-card live-draft" :class="interimSpeaker === 1 ? 'speaker-one' : 'speaker-two'">
                 <div class="speaker-meta">
-                  <span class="speaker-avatar"><UserRound :size="23" /></span><strong>{{ interimSpeaker === 1 ? '办事群众' : '窗口人员' }}</strong><em>{{ interimSpeaker === 1 ? dialect : '普通话' }}</em>
+                  <span class="speaker-avatar"><UserRound :size="23" /></span><strong>发言人 {{ interimSpeaker }}</strong><em>身份预判</em>
                   <small class="speaker-confidence">预判 {{ Math.round(interimSpeakerConfidence * 100) }}%</small>
                   <span class="sentence-status pending"><i></i>识别中 · 等待断句</span>
                   <div class="audio-line active"><i v-for="n in 50" :key="n" :style="{ height: `${5 + (n * (interimSpeaker === 1 ? 11 : 13)) % 19}px` }"></i></div>

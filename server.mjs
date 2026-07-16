@@ -666,7 +666,16 @@ async function handleAssist(req, res) {
     return
   }
   const transcript = messages.map((message) => {
-    const role = Number(message.speaker) === 1 ? '办事群众' : '窗口人员'
+    let role
+    if (message.identitySource === 'voiceprint' || message.identitySource === 'session' || message.voiceprintMatched === true) {
+      role = '窗口人员'
+    } else if (message.identitySource === 'unmatched') {
+      role = '办事群众'
+    } else if (message.identitySource === 'manual') {
+      role = Number(message.speaker) === 2 ? '窗口人员' : '办事群众'
+    } else {
+      role = `发言人 ${Number(message.acousticSpeaker || message.speaker) || 1}（身份未确认）`
+    }
     return `${role}：${String(message.translation || message.text || '').slice(0, 800)}`
   }).join('\n').slice(0, 10000)
   const upstream = await fetch(CHAT_URL, {

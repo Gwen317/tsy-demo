@@ -1,4 +1,5 @@
 import { identifyVoiceprint, joinAudioBuffers } from './voiceprint'
+import { createSpeakerIdentityResolver, type IdentitySource } from './speaker-identity'
 
 export interface RecognitionResult {
   text: string
@@ -6,9 +7,12 @@ export interface RecognitionResult {
   beginTime: number
   endTime: number
   speaker: 1 | 2
+  acousticSpeaker: 1 | 2
   speakerConfidence: number
   staffName?: string
   voiceprintMatched?: boolean
+  identityResolved?: boolean
+  identitySource?: IdentitySource
 }
 
 interface RecognitionCallbacks {
@@ -149,6 +153,7 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
   let lastFinalAt = 0
   let noiseFloor = 0.003
   let gateGain = 1
+  const identityResolver = createSpeakerIdentityResolver()
   const clusters: VoiceCluster[] = []
 
   function reduceBackgroundNoise(input: Float32Array) {
@@ -251,13 +256,20 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         lastFinalAt = Date.now()
       }
       const assignment = final ? assignSpeaker() : previewSpeaker()
+      const acousticSpeaker = assignment.speaker
+      const provisionalIdentity = identityResolver.provisional(acousticSpeaker, assignment.confidence)
       const result: RecognitionResult = {
         text,
         final,
         beginTime: Number(message.begin_time || 0),
         endTime,
-        speaker: assignment.speaker,
-        speakerConfidence: assignment.confidence,
+        speaker: final || provisionalIdentity.identityResolved ? provisionalIdentity.speaker : acousticSpeaker,
+        acousticSpeaker,
+        speakerConfidence: provisionalIdentity.confidence,
+        staffName: final ? provisionalIdentity.staffName : undefined,
+        voiceprintMatched: final ? provisionalIdentity.voiceprintMatched : false,
+        identityResolved: final ? provisionalIdentity.identityResolved : false,
+        identitySource: final ? provisionalIdentity.identitySource : undefined,
       }
       callbacks.onResult?.(result)
 
@@ -266,13 +278,17 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         utteranceAudio = []
         if (audio) {
           void identifyVoiceprint(audio).then((match) => {
-            if (!match.matched || stopped) return
+            if (stopped) return
+            const identity = identityResolver.resolve(acousticSpeaker, assignment.confidence, match)
+
             callbacks.onSpeakerResolved?.({
               ...result,
-              speaker: 2,
-              speakerConfidence: match.confidence ?? match.score,
-              staffName: match.name || undefined,
-              voiceprintMatched: true,
+              speaker: identity.speaker,
+              speakerConfidence: identity.confidence,
+              staffName: identity.staffName,
+              voiceprintMatched: identity.voiceprintMatched,
+              identityResolved: identity.identityResolved,
+              identitySource: identity.identitySource,
             })
           }).catch(() => {
             // The acoustic speaker assignment remains usable while the online match is unavailable.

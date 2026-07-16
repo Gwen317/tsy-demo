@@ -195,7 +195,15 @@ export async function streamTranslateToMandarin(text: string, onUpdate: (text: s
 }
 
 export function generateConversationAssist(
-  messages: Array<{ speaker: number; text: string; translation: string }>,
+  messages: Array<{
+    speaker: number
+    acousticSpeaker?: number
+    text: string
+    translation: string
+    identityResolved?: boolean
+    identitySource?: string
+    voiceprintMatched?: boolean
+  }>,
   service: string,
   dialect: string,
 ) {
