@@ -56,7 +56,7 @@ async function readResponse<T>(response: Response) {
 }
 
 export async function listVoiceprints() {
-  return readResponse<{ ready: boolean; staff: VoiceprintStaff[] }>(await fetch('/api/voiceprints'))
+  return readResponse<{ ready: boolean; provider?: 'local' | 'xfyun'; threshold?: number; staff: VoiceprintStaff[] }>(await fetch('/api/voiceprints'))
 }
 
 export async function enrollVoiceprint(staffId: string, name: string, pcm: ArrayBuffer) {

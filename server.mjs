@@ -1,5 +1,5 @@
 import { createServer as createHttpServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -25,8 +25,15 @@ const CHAT_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/complet
 const REALTIME_TTS_URL = `wss://${WORKSPACE_ID}.${REGION}.maas.aliyuncs.com/api-ws/v1/inference`
 const VOICEPRINT_DIR = path.join(rootDir, '.voiceprint-data')
 const VOICEPRINT_FILE = path.join(VOICEPRINT_DIR, 'voiceprints.json')
-const VOICEPRINT_THRESHOLD = Number(process.env.VOICEPRINT_THRESHOLD || 0.995)
-const voiceprintReady = true
+const VOICEPRINT_THRESHOLD = Number(process.env.VOICEPRINT_THRESHOLD || 0.99)
+const XFYUN_APP_ID = process.env.XFYUN_APP_ID || ''
+const XFYUN_API_KEY = process.env.XFYUN_API_KEY || ''
+const XFYUN_API_SECRET = process.env.XFYUN_API_SECRET || ''
+const XFYUN_VOICEPRINT_URL = process.env.XFYUN_VOICEPRINT_URL || 'https://api.xf-yun.com/v1/private/s1aa729d0'
+const XFYUN_VOICEPRINT_GROUP_ID = process.env.XFYUN_VOICEPRINT_GROUP_ID || 'tsy_staff'
+const XFYUN_VOICEPRINT_CONFIGURED = Boolean(XFYUN_APP_ID && XFYUN_API_KEY && XFYUN_API_SECRET)
+const VOICEPRINT_PROVIDER = (process.env.VOICEPRINT_PROVIDER || (XFYUN_VOICEPRINT_CONFIGURED ? 'xfyun' : 'local')).toLowerCase()
+const voiceprintReady = VOICEPRINT_PROVIDER === 'xfyun' ? XFYUN_VOICEPRINT_CONFIGURED : true
 Meyda.sampleRate = 16000
 Meyda.bufferSize = 512
 Meyda.numberOfMFCCCoefficients = 13
@@ -103,7 +110,7 @@ function cosineSimilarity(left, right) {
   return left.reduce((sum, value, index) => sum + value * (right[index] || 0), 0)
 }
 
-async function callVoiceprint(action, payload = {}) {
+async function callLocalVoiceprint(action, payload = {}) {
   const database = await loadVoiceprints()
   if (action === 'list') return { staff: Object.entries(database).map(([staffId, item]) => ({ staff_id: staffId, name: item.name, samples: item.samples })) }
   if (action === 'delete') {
@@ -138,6 +145,210 @@ async function callVoiceprint(action, payload = {}) {
     }
   }
   throw new Error('未知的声纹操作。')
+}
+
+function xfyunResultFormat() {
+  return { encoding: 'utf8', compress: 'raw', format: 'json' }
+}
+
+function xfyunFeatureId(staffId) {
+  return `vp_${createHash('sha256').update(staffId).digest('hex').slice(0, 24)}`
+}
+
+function xfyunFeatureInfo(staffId, name, samples) {
+  return JSON.stringify({ staff_id: staffId, name, samples })
+}
+
+function parseXfyunFeature(feature) {
+  try {
+    const info = JSON.parse(feature.featureInfo || '{}')
+    return {
+      staff_id: String(info.staff_id || feature.featureId),
+      name: String(info.name || info.staff_id || feature.featureId),
+      samples: Math.max(1, Number(info.samples) || 1),
+      feature_id: feature.featureId,
+    }
+  } catch {
+    return {
+      staff_id: feature.featureId,
+      name: feature.featureInfo || feature.featureId,
+      samples: 1,
+      feature_id: feature.featureId,
+    }
+  }
+}
+
+function xfyunAudioPayload(audio) {
+  if (!audio || Buffer.byteLength(audio, 'base64') < 32000) throw new Error('有效语音不足 1 秒。')
+  return {
+    resource: {
+      encoding: 'raw',
+      sample_rate: 16000,
+      channels: 1,
+      bit_depth: 16,
+      status: 3,
+      audio,
+    },
+  }
+}
+
+function createXfyunAuthUrl() {
+  const endpoint = new URL(XFYUN_VOICEPRINT_URL)
+  const date = new Date().toUTCString()
+  const requestLine = `POST ${endpoint.pathname} HTTP/1.1`
+  const signatureOrigin = `host: ${endpoint.host}\ndate: ${date}\n${requestLine}`
+  const signature = createHmac('sha256', XFYUN_API_SECRET).update(signatureOrigin).digest('base64')
+  const authorizationOrigin = `api_key="${XFYUN_API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`
+  endpoint.searchParams.set('authorization', Buffer.from(authorizationOrigin).toString('base64'))
+  endpoint.searchParams.set('host', endpoint.host)
+  endpoint.searchParams.set('date', date)
+  return endpoint
+}
+
+function xfyunServiceError(decoded) {
+  if (!decoded || Array.isArray(decoded) || typeof decoded !== 'object') return null
+  const code = Number(decoded.code ?? decoded.ret ?? 0)
+  if (!code) return null
+  const detail = decoded.desc || decoded.message || decoded.msg || decoded.info || '未知错误'
+  return new Error(`讯飞声纹服务返回错误：${detail}（${code}）`)
+}
+
+async function requestXfyunVoiceprint(func, parameters = {}, payload) {
+  if (!XFYUN_VOICEPRINT_CONFIGURED) throw new Error('讯飞声纹鉴权信息未配置完整。')
+  const resultKey = `${func}Res`
+  const body = {
+    header: { app_id: XFYUN_APP_ID, status: 3 },
+    parameter: {
+      s1aa729d0: {
+        func,
+        ...parameters,
+        [resultKey]: xfyunResultFormat(),
+      },
+    },
+    ...(payload ? { payload } : {}),
+  }
+  const response = await fetch(createXfyunAuthUrl(), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20000),
+  })
+  const result = await response.json().catch(() => ({}))
+  if (!response.ok || Number(result.header?.code || 0) !== 0) {
+    throw new Error(`讯飞声纹请求失败：${result.header?.message || response.statusText || response.status}`)
+  }
+  const encoded = result.payload?.[resultKey]?.text
+  if (!encoded) return {}
+  const decoded = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))
+  const serviceError = xfyunServiceError(decoded)
+  if (serviceError) throw serviceError
+  return decoded
+}
+
+let xfyunGroupPromise
+
+function isXfyunEmptyGroupError(error) {
+  return error instanceof Error && /groupId is empty|声纹库为空|特征库为空/i.test(error.message)
+}
+
+async function ensureXfyunGroup() {
+  if (!xfyunGroupPromise) {
+    xfyunGroupPromise = (async () => {
+      try {
+        await requestXfyunVoiceprint('createGroup', {
+          groupId: XFYUN_VOICEPRINT_GROUP_ID,
+          groupName: 'Tsy staff voiceprints',
+          groupInfo: 'Staff identity profiles for the Tsy demo',
+        })
+      } catch (createError) {
+        try {
+          await requestXfyunVoiceprint('queryFeatureList', { groupId: XFYUN_VOICEPRINT_GROUP_ID })
+        } catch (queryError) {
+          if (isXfyunEmptyGroupError(queryError)) return
+          throw createError
+        }
+      }
+    })().catch((error) => {
+      xfyunGroupPromise = null
+      throw error
+    })
+  }
+  return xfyunGroupPromise
+}
+
+async function listXfyunFeatures() {
+  await ensureXfyunGroup()
+  try {
+    const result = await requestXfyunVoiceprint('queryFeatureList', { groupId: XFYUN_VOICEPRINT_GROUP_ID })
+    return (Array.isArray(result) ? result : []).map(parseXfyunFeature)
+  } catch (error) {
+    if (isXfyunEmptyGroupError(error)) return []
+    throw error
+  }
+}
+
+async function callXfyunVoiceprint(action, payload = {}) {
+  const staff = await listXfyunFeatures()
+  if (action === 'list') return { staff: staff.map(({ feature_id, ...item }) => item) }
+  if (action === 'delete') {
+    const existing = staff.find((item) => item.staff_id === payload.staff_id)
+    if (!existing) return { removed: false }
+    await requestXfyunVoiceprint('deleteFeature', {
+      groupId: XFYUN_VOICEPRINT_GROUP_ID,
+      featureId: existing.feature_id,
+    })
+    return { removed: true }
+  }
+  if (action === 'enroll') {
+    if (!payload.staff_id || !payload.name) throw new Error('员工编号和姓名不能为空。')
+    const existing = staff.find((item) => item.staff_id === payload.staff_id)
+    const samples = existing ? existing.samples + 1 : 1
+    const featureId = existing?.feature_id || xfyunFeatureId(payload.staff_id)
+    const featureInfo = xfyunFeatureInfo(payload.staff_id, payload.name, samples)
+    const audioPayload = xfyunAudioPayload(payload.audio)
+    if (existing) {
+      await requestXfyunVoiceprint('updateFeature', {
+        groupId: XFYUN_VOICEPRINT_GROUP_ID,
+        featureId,
+        featureInfo,
+        cover: false,
+      }, audioPayload)
+    } else {
+      await requestXfyunVoiceprint('createFeature', {
+        groupId: XFYUN_VOICEPRINT_GROUP_ID,
+        featureId,
+        featureInfo,
+      }, audioPayload)
+    }
+    return { staff_id: payload.staff_id, name: payload.name, samples }
+  }
+  if (action === 'identify') {
+    if (!staff.length) return { matched: false, score: 0, reason: 'VOICEPRINT_DATABASE_EMPTY' }
+    const result = await requestXfyunVoiceprint('searchFea', {
+      groupId: XFYUN_VOICEPRINT_GROUP_ID,
+      topK: 1,
+    }, xfyunAudioPayload(payload.audio))
+    const best = Array.isArray(result.scoreList) ? result.scoreList[0] : null
+    if (!best) return { matched: false, score: 0, reason: 'VOICEPRINT_NO_MATCH' }
+    const profile = staff.find((item) => item.feature_id === best.featureId) || parseXfyunFeature(best)
+    const score = Number(best.score || 0)
+    const matched = score >= VOICEPRINT_THRESHOLD
+    return {
+      matched,
+      staff_id: matched ? profile.staff_id : null,
+      name: matched ? profile.name : null,
+      score: Number(score.toFixed(4)),
+      confidence: Number(Math.max(0, score).toFixed(4)),
+      threshold: VOICEPRINT_THRESHOLD,
+    }
+  }
+  throw new Error('未知的声纹操作。')
+}
+
+async function callVoiceprint(action, payload = {}) {
+  return VOICEPRINT_PROVIDER === 'xfyun'
+    ? callXfyunVoiceprint(action, payload)
+    : callLocalVoiceprint(action, payload)
 }
 
 const voiceProfiles = {
@@ -655,6 +866,7 @@ async function main() {
         voice_profiles: voiceProfiles,
         capabilities: ['cosyvoice-streaming-tts', 'fun-asr-realtime', 'voiceprint-identification', 'two-speaker-acoustic-clustering', 'qwen-dialect-rewrite', 'qwen-live-assist'],
         voiceprint_ready: voiceprintReady,
+        voiceprint_provider: VOICEPRINT_PROVIDER,
       })
       return
     }
@@ -683,7 +895,7 @@ async function main() {
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/voiceprints') {
-      callVoiceprint('list').then((result) => sendJson(res, 200, { ready: true, ...result })).catch((error) => sendJson(res, 503, { ready: false, error: error.message }))
+      callVoiceprint('list').then((result) => sendJson(res, 200, { ready: voiceprintReady, provider: VOICEPRINT_PROVIDER, threshold: VOICEPRINT_THRESHOLD, ...result })).catch((error) => sendJson(res, 503, { ready: false, provider: VOICEPRINT_PROVIDER, error: error.message }))
       return
     }
     if (req.method === 'POST' && url.pathname === '/api/voiceprints/enroll') {
@@ -768,6 +980,7 @@ async function main() {
     console.log(`Aliyun DashScope: ${API_KEY ? 'configured' : 'missing DASHSCOPE_API_KEY'}`)
     console.log(`CosyVoice model=${MODEL} defaultVoice=${DEFAULT_VOICE}`)
     console.log(`ASR model=${ASR_MODEL}`)
+    console.log(`Voiceprint provider=${VOICEPRINT_PROVIDER} ${voiceprintReady ? 'configured' : 'missing credentials'}`)
   })
 }
 

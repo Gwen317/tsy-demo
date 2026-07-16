@@ -93,6 +93,7 @@ const interimText = ref('')
 const micLevel = ref(0)
 const voiceprintStaff = ref<VoiceprintStaff[]>([])
 const voiceprintReady = ref(false)
+const voiceprintProvider = ref<'local' | 'xfyun'>('local')
 const voiceprintLoading = ref(false)
 const voiceprintRecording = ref(false)
 const voiceprintRemaining = ref(0)
@@ -375,6 +376,7 @@ async function loadVoiceprints() {
   try {
     const result = await listVoiceprints()
     voiceprintReady.value = result.ready
+    voiceprintProvider.value = result.provider || 'local'
     voiceprintStaff.value = result.staff
   } catch {
     voiceprintReady.value = false
@@ -723,7 +725,7 @@ onBeforeUnmount(() => {
           <em>{{ aliyunConfig?.configured ? '流式' : '未连接' }}</em>
         </div>
         <section class="voiceprint-panel">
-          <div class="voiceprint-heading"><span class="provider-icon"><Fingerprint :size="21" /></span><span><strong>工作人员声纹</strong><small>{{ voiceprintReady ? voiceprintStaff.length ? `已登记 ${voiceprintStaff.length} 位工作人员` : '模型就绪，等待录入' : '声纹模型未就绪' }}</small></span></div>
+          <div class="voiceprint-heading"><span class="provider-icon"><Fingerprint :size="21" /></span><span><strong>工作人员声纹</strong><small>{{ voiceprintReady ? voiceprintStaff.length ? `${voiceprintProvider === 'xfyun' ? '讯飞在线' : '本地'} · 已登记 ${voiceprintStaff.length} 位工作人员` : `${voiceprintProvider === 'xfyun' ? '讯飞在线服务' : '本地模型'}就绪，等待录入` : '声纹服务未就绪' }}</small></span></div>
           <div class="voiceprint-fields"><label><span>工号</span><input v-model="voiceprintStaffId" :disabled="voiceprintRecording" /></label><label><span>姓名</span><input v-model="voiceprintStaffName" :disabled="voiceprintRecording" /></label></div>
           <label class="voiceprint-consent"><input v-model="voiceprintConsent" type="checkbox" :disabled="voiceprintRecording" /><span>已取得工作人员本人授权，仅保存声纹向量</span></label>
           <button class="enroll-voiceprint" :class="{ recording: voiceprintRecording }" :disabled="!voiceprintReady || !voiceprintConsent || voiceprintLoading || isListening" @click="recordVoiceprint"><MicOff v-if="voiceprintRecording" :size="18" /><Fingerprint v-else :size="18" />{{ voiceprintRecording ? `录入中 · ${voiceprintRemaining} 秒` : isListening ? '请先暂停实时收音' : '录入 8 秒声纹样本' }}</button>
