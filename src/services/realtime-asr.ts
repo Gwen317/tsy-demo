@@ -174,7 +174,7 @@ export async function startRealtimeRecognition(callbacks: RecognitionCallbacks =
         try {
           const match = await identifyVoiceprint(audio)
           if (match.matched) {
-            assignment = { speaker: 2, confidence: match.score }
+            assignment = { speaker: 2, confidence: match.confidence ?? match.score }
             staffName = match.name || undefined
             voiceprintMatched = true
           }

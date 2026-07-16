@@ -25,7 +25,7 @@ const CHAT_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/complet
 const REALTIME_TTS_URL = `wss://${WORKSPACE_ID}.${REGION}.maas.aliyuncs.com/api-ws/v1/inference`
 const VOICEPRINT_DIR = path.join(rootDir, '.voiceprint-data')
 const VOICEPRINT_FILE = path.join(VOICEPRINT_DIR, 'voiceprints.json')
-const VOICEPRINT_THRESHOLD = Number(process.env.VOICEPRINT_THRESHOLD || 0.97)
+const VOICEPRINT_THRESHOLD = Number(process.env.VOICEPRINT_THRESHOLD || 0.995)
 const voiceprintReady = true
 Meyda.sampleRate = 16000
 Meyda.bufferSize = 512
@@ -126,7 +126,16 @@ async function callVoiceprint(action, payload = {}) {
     const candidates = Object.entries(database).map(([staffId, item]) => ({ staffId, item, score: cosineSimilarity(embedding, item.embedding) })).sort((a, b) => b.score - a.score)
     if (!candidates.length) return { matched: false, score: 0, reason: 'VOICEPRINT_DATABASE_EMPTY' }
     const best = candidates[0]
-    return { matched: best.score >= VOICEPRINT_THRESHOLD, staff_id: best.score >= VOICEPRINT_THRESHOLD ? best.staffId : null, name: best.score >= VOICEPRINT_THRESHOLD ? best.item.name : null, score: Number(best.score.toFixed(4)), threshold: VOICEPRINT_THRESHOLD }
+    const matched = best.score >= VOICEPRINT_THRESHOLD
+    const confidence = matched ? Math.min(1, 0.8 + ((best.score - VOICEPRINT_THRESHOLD) / (1 - VOICEPRINT_THRESHOLD)) * 0.2) : 0
+    return {
+      matched,
+      staff_id: matched ? best.staffId : null,
+      name: matched ? best.item.name : null,
+      score: Number(best.score.toFixed(4)),
+      confidence: Number(confidence.toFixed(4)),
+      threshold: VOICEPRINT_THRESHOLD,
+    }
   }
   throw new Error('未知的声纹操作。')
 }

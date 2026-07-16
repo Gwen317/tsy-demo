@@ -9,6 +9,7 @@ export interface VoiceprintMatch {
   staff_id?: string | null
   name?: string | null
   score: number
+  confidence?: number
   threshold?: number
   reason?: string
 }
