@@ -648,6 +648,85 @@ async function handleTranslateStream(req, res) {
   res.end(`${JSON.stringify({ done: true })}\n`)
 }
 
+function toShortStringList(value, limit, fallback) {
+  const items = Array.isArray(value) ? value.map((item) => String(item || '').trim()).filter(Boolean).slice(0, limit) : []
+  return items.length ? items : fallback
+}
+
+function emptyPolicyReference() {
+  return {
+    status: 'none',
+    title: '无可核验参考',
+    issuer: '',
+    version_or_date: '',
+    url: '',
+    citation_location: '',
+  }
+}
+
+function isOfficialGovernmentHost(hostname) {
+  const normalized = String(hostname || '').toLowerCase().replace(/\.$/, '')
+  return normalized === 'gov.cn' || normalized.endsWith('.gov.cn')
+}
+
+async function verifyPolicyReference(candidate) {
+  if (!candidate || typeof candidate !== 'object') return emptyPolicyReference()
+  const reference = {
+    title: String(candidate.title || '').trim().slice(0, 300),
+    issuer: String(candidate.issuer || '').trim().slice(0, 160),
+    version_or_date: String(candidate.version_or_date || '').trim().slice(0, 100),
+    url: String(candidate.url || '').trim().slice(0, 2000),
+    citation_location: String(candidate.citation_location || '').trim().slice(0, 300),
+  }
+  if (Object.values(reference).some((value) => !value)) return emptyPolicyReference()
+  let sourceUrl
+  try {
+    sourceUrl = new URL(reference.url)
+  } catch {
+    return emptyPolicyReference()
+  }
+  if (sourceUrl.protocol !== 'https:' || !isOfficialGovernmentHost(sourceUrl.hostname)) return emptyPolicyReference()
+  try {
+    const response = await fetch(sourceUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(4500),
+      headers: { 'user-agent': 'TSY-Demo-Policy-Reference-Verifier/1.0' },
+    })
+    const finalUrl = new URL(response.url)
+    if (!response.ok || finalUrl.protocol !== 'https:' || !isOfficialGovernmentHost(finalUrl.hostname)) return emptyPolicyReference()
+    return { status: 'verified', ...reference, url: finalUrl.href }
+  } catch {
+    return emptyPolicyReference()
+  }
+}
+
+async function verifyPolicyReferences(candidates) {
+  const list = (Array.isArray(candidates) ? candidates : [candidates]).filter(Boolean).slice(0, 3)
+  if (!list.length) return emptyPolicyReference()
+  const verified = await Promise.all(list.map((candidate) => verifyPolicyReference(candidate)))
+  return verified.find((reference) => reference.status === 'verified') || emptyPolicyReference()
+}
+
+function containsUnstatedNumber(text, transcript) {
+  const numbers = String(text || '').match(/\d+(?:\.\d+)?/g) || []
+  return numbers.some((number) => !transcript.includes(number))
+}
+
+function isExplicitFact(text) {
+  return !/(未说明|未提供|未明确|尚未|不清楚|无法确认|待确认|需要确认|未知|无任何|没有出现|未出现|暗示|可能|疑似|推测|表明|倾向|表现出)/.test(text)
+}
+
+function isSafeMissingInformation(text) {
+  return !/(证明|就业|住所|就读|登记卡|户籍|港澳|华侨|外国人|资格|费用|期限|时限|满[一二三四五六七八九十\d])/.test(text)
+}
+
+function isSafeSuggestedQuestion(text, transcript) {
+  if (/(比如|例如)/.test(text)) return false
+  const specificTerms = ['身份证', '通行证', '社保卡', '登记卡', '居住证明', '就业证明', '就读证明']
+  return specificTerms.every((term) => !text.includes(term) || transcript.includes(term))
+}
+
 async function handleAssist(req, res) {
   if (!API_KEY) {
     sendJson(res, 503, { error: '阿里云百炼 API Key 尚未配置。', code: 'ALIYUN_NOT_CONFIGURED' })
@@ -687,14 +766,15 @@ async function handleAssist(req, res) {
       messages: [
         {
           role: 'system',
-          content: '你是政务服务窗口的实时辅助助手。根据对话生成工作人员下一步可直接使用的回复建议，并持续维护客观摘要。严格规则：1. 只能引用对话里逐字出现过的事实；2. 如果群众的问题在对话中尚未被工作人员回答，reply 必须只做澄清追问或表示需要查询当地官方办事指南，绝对不能直接给出答案；3. 对话没有出现的材料名称、政策、金额、地址、时限、办理条件、资格要求不得出现在任何字段；4. summary 只能复述已经说过的话，不能列出“未说明”的推断项。违反规则会导致政务错误。只输出 JSON。',
+          content: '你是政务服务窗口的事项理解与政策材料检索助手。严格规则：1. key_facts 只能复述当前对话中明确出现的事实，“未说明”“尚未确认”等内容不得放入 key_facts；2. candidates 是事项候选，属于 AI 推断，不能写成行政判断或受理结论；3. missing_information 只列出为了确认用户诉求和事项类型仍需询问的信息，不得写入对话中没有的具体政策门槛、数字、材料或资格条件；4. suggested_question 只输出一句最有价值、可直接向群众询问的意图澄清问题，不得询问未经可靠政策引用支持的具体门槛；5. policy_references 可给出最多三条候选，必须来自本次联网检索、可访问的 gov.cn 官方网页，优先选择链接稳定的中央政府基础法规，并包含材料名称、发布机构、版本或发布日期、原始链接和页面内的具体引用位置；6. 不确定来源真实性、版本信息或引用位置时，policy_references 输出空数组；7. 不得自行生成政策答案，不得编造材料、条件、费用、地址、期限或办理结论。只输出 JSON。',
         },
         {
           role: 'user',
-          content: `服务窗口：${String(body.service || '政务咨询窗口')}\n识别方言：${String(body.dialect || '粤语')}\n\n当前对话：\n${transcript}\n\n输出结构：{"suggestion":{"intro":"一句引导语","items":["2至4条关键回复要点"],"closing":"一句风险提示或下一步","reply":"工作人员可直接说出的完整简洁回复"},"summary":["3至6条按事实组织的会话摘要"]}`,
+          content: `服务窗口：${String(body.service || '政务咨询窗口')}\n识别方言：${String(body.dialect || '粤语')}\n\n当前对话：\n${transcript}\n\n输出结构：{"matter":{"candidates":["1至3个事项候选"],"key_facts":["2至5条对话事实"],"missing_information":["1至4项待确认信息"],"suggested_question":"一句建议追问"},"policy_references":[{"title":"政策或材料名称","issuer":"发布机构","version_or_date":"版本或发布日期","url":"https://...gov.cn/...","citation_location":"章节、条款或页面栏目"}]}。没有可靠官方来源时 policy_references 输出 []。`,
         },
       ],
-      temperature: 0.25,
+      enable_search: true,
+      temperature: 0.1,
     }),
   })
   const data = await upstream.json().catch(() => null)
@@ -710,16 +790,19 @@ async function handleAssist(req, res) {
     sendJson(res, 502, { error: 'AI 回复结构解析失败。', code: 'ASSIST_JSON_INVALID' })
     return
   }
-  const suggestion = parsed?.suggestion || {}
-  const summary = Array.isArray(parsed?.summary) ? parsed.summary.map(String).filter(Boolean).slice(0, 8) : []
+  const matter = parsed?.matter || {}
+  const keyFacts = toShortStringList(matter.key_facts, 5, []).filter(isExplicitFact)
+  const missingInformation = toShortStringList(matter.missing_information, 4, []).filter((item) => !containsUnstatedNumber(item, transcript) && isSafeMissingInformation(item))
+  const rawQuestion = String(matter.suggested_question || '').trim().slice(0, 200)
+  const policyReference = await verifyPolicyReferences(parsed?.policy_references || parsed?.policy_reference)
   sendJson(res, 200, {
-    suggestion: {
-      intro: String(suggestion.intro || '根据当前咨询内容，建议这样回复：'),
-      items: Array.isArray(suggestion.items) ? suggestion.items.map(String).filter(Boolean).slice(0, 5) : [],
-      closing: String(suggestion.closing || '具体要求请以当地最新规定为准。'),
-      reply: String(suggestion.reply || suggestion.closing || ''),
+    matter: {
+      candidates: toShortStringList(matter.candidates, 3, ['待确认具体办理事项']),
+      key_facts: keyFacts.length ? keyFacts : ['当前会话信息不足，暂未提取到明确事实'],
+      missing_information: missingInformation.length ? missingInformation : ['具体办理类型与当前诉求范围'],
+      suggested_question: rawQuestion && !containsUnstatedNumber(rawQuestion, transcript) && isSafeSuggestedQuestion(rawQuestion, transcript) ? rawQuestion : '请问您这次最希望确认的是办理条件、所需材料还是具体流程？',
     },
-    summary,
+    policy_reference: policyReference,
     model: REWRITE_MODEL,
   })
 }

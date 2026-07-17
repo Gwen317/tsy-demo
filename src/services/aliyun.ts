@@ -21,13 +21,20 @@ interface RewriteResult {
 }
 
 export interface AssistResult {
-  suggestion: {
-    intro: string
-    items: string[]
-    closing: string
-    reply: string
+  matter: {
+    candidates: string[]
+    key_facts: string[]
+    missing_information: string[]
+    suggested_question: string
   }
-  summary: string[]
+  policy_reference: {
+    status: 'verified' | 'none'
+    title: string
+    issuer: string
+    version_or_date: string
+    url: string
+    citation_location: string
+  }
   model: string
 }
 

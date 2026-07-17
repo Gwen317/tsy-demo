@@ -1,14 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  Bot,
   ArrowLeftRight,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Cloud,
   Clock3,
-  FileText,
+  ExternalLink,
   Fingerprint,
   Globe2,
   House,
@@ -31,7 +30,7 @@ import {
   Volume2,
   X,
 } from 'lucide-vue-next'
-import { generateConversationAssist, getAliyunConfig, rewriteDialect, streamSpeech, streamTranslateToMandarin, synthesizeSpeech, translateToMandarin, type AliyunConfig } from './services/aliyun'
+import { generateConversationAssist, getAliyunConfig, streamSpeech, streamTranslateToMandarin, synthesizeSpeech, translateToMandarin, type AliyunConfig } from './services/aliyun'
 import { startRealtimeRecognition, type RecognitionResult } from './services/realtime-asr'
 import { captureVoiceprintSample, deleteVoiceprint, enrollVoiceprint, listVoiceprints, type VoiceprintStaff } from './services/voiceprint'
 
@@ -66,11 +65,20 @@ interface Conversation {
   messages: TranscriptMessage[]
 }
 
-interface Suggestion {
-  intro: string
-  items: string[]
-  closing: string
-  reply: string
+interface MatterUnderstanding {
+  candidates: string[]
+  key_facts: string[]
+  missing_information: string[]
+  suggested_question: string
+}
+
+interface PolicyReference {
+  status: 'verified' | 'none'
+  title: string
+  issuer: string
+  version_or_date: string
+  url: string
+  citation_location: string
 }
 
 const STORAGE_KEY = 'tsy-demo-state-v2'
@@ -84,9 +92,8 @@ const activeConversationId = ref(1)
 const isListening = ref(false)
 const elapsed = ref(0)
 const appliedSuggestion = ref(false)
-const expandedSummary = ref(false)
-const aiSuggestion = ref<Suggestion | null>(null)
-const aiSummary = ref<string[]>([])
+const aiMatter = ref<MatterUnderstanding | null>(null)
+const aiPolicyReference = ref<PolicyReference | null>(null)
 const assistLoading = ref(false)
 const settingsOpen = ref(false)
 const profileOpen = ref(false)
@@ -173,34 +180,29 @@ const bars = Array.from({ length: 76 }, (_, index) => {
   return Math.max(7, Math.round((12 + wave * 34) * Math.max(0.25, envelope)))
 })
 
-const fallbackSuggestion: Suggestion =
-  {
-    intro: '您好，办理居住证一般需要以下材料：',
-    items: ['身份证明（身份证原件及复印件）', '居住证明（房屋租赁合同或房东证明）', '近期免冠照片（1寸）', '其他材料（根据当地具体要求）'],
-    closing: '建议您提前准备好以上材料，具体要求可咨询现场工作人员或查看当地政务服务网。',
-    reply: '您好，一般需要身份证、居住证明和近期照片。如果是租房居住，还请带好租赁合同；具体材料以本地窗口要求为准。',
-  }
+const fallbackMatter: MatterUnderstanding = {
+  candidates: ['待识别事项'],
+  key_facts: ['正在根据当前会话提取已明确的信息'],
+  missing_information: ['具体办理地区', '申请人的实际情况'],
+  suggested_question: '请问您准备在哪个地区办理，当前最希望确认的是材料、条件还是办理流程？',
+}
+const emptyPolicyReference: PolicyReference = {
+  status: 'none',
+  title: '无可核验参考',
+  issuer: '',
+  version_or_date: '',
+  url: '',
+  citation_location: '',
+}
 
 const activeConversation = computed(() => conversations.value.find((item) => item.id === activeConversationId.value) ?? conversations.value[0])
-const currentSuggestion = computed(() => aiSuggestion.value || fallbackSuggestion)
+const currentMatter = computed(() => aiMatter.value || fallbackMatter)
+const currentPolicyReference = computed(() => aiPolicyReference.value || emptyPolicyReference)
 const currentVoiceProfile = computed(() => aliyunConfig.value?.voice_profiles?.[dialect.value] ?? null)
 const sessionTitle = computed(() => activeConversation.value?.title ?? '新的咨询会话')
 const messages = computed(() => activeConversation.value?.messages ?? [])
 const formattedElapsed = computed(() => formatTime(elapsed.value))
 const isLive = computed(() => activeConversation.value?.status === 'live')
-const summaryItems = computed(() => {
-  if (aiSummary.value.length) return aiSummary.value
-  const count = messages.value.length
-  if (sessionTitle.value.includes('社保')) return ['群众咨询社保转入新单位的办理流程。', '需先确认原单位已完成社保减员。', '新单位办理增员后社保关系将自动接续。', '可通过社保服务平台查询接续状态。']
-  if (sessionTitle.value.includes('租房')) return ['群众咨询租房备案是否需要房东到场。', '可根据当地规定通过授权方式办理。', '授权办理需准备授权书及双方身份证明。', '具体要求以房屋所在地受理窗口为准。']
-  const items = ['群众咨询居住证办理所需材料清单。']
-  if (count >= 2) items.push('工作人员说明需身份证、居住证明、照片等。')
-  if (count >= 3) items.push('群众进一步确认租房居住的证明要求。')
-  if (count >= 4) items.push('租房人员可准备租赁合同或房东证明。')
-  items.push('具体材料以当地政策要求为准。')
-  return items
-})
-
 async function updateConversationAssist(showFeedback = false) {
   if (!messages.value.length || !aliyunConfig.value?.configured) return
   const requestSequence = ++assistRequestSequence
@@ -209,9 +211,9 @@ async function updateConversationAssist(showFeedback = false) {
   try {
     const result = await generateConversationAssist(messages.value, service.value, dialect.value)
     if (requestSequence !== assistRequestSequence) return
-    aiSuggestion.value = result.suggestion
-    aiSummary.value = result.summary
-    if (showFeedback) showToast('AI 回复和实时摘要已更新')
+    aiMatter.value = result.matter
+    aiPolicyReference.value = result.policy_reference
+    if (showFeedback) showToast('事项理解和政策引用已更新')
   } catch {
     if (showFeedback) showToast('AI 辅助暂不可用，已保留当前内容')
   } finally {
@@ -428,9 +430,8 @@ async function createNewSession() {
   activeConversationId.value = id
   elapsed.value = 0
   appliedSuggestion.value = false
-  expandedSummary.value = false
-  aiSuggestion.value = null
-  aiSummary.value = []
+  aiMatter.value = null
+  aiPolicyReference.value = null
   isListening.value = false
   view.value = 'session'
   startClock()
@@ -447,8 +448,8 @@ async function openSession(id: number) {
   elapsed.value = conversation.duration
   isListening.value = false
   appliedSuggestion.value = false
-  aiSuggestion.value = null
-  aiSummary.value = []
+  aiMatter.value = null
+  aiPolicyReference.value = null
   view.value = 'session'
   startClock()
   if (conversation.messages.length) scheduleConversationAssist(100)
@@ -542,22 +543,11 @@ function refreshSuggestion() {
 
 async function useSuggestion() {
   if (appliedSuggestion.value) return
-  let translatedReply = currentSuggestion.value.reply
-  if (aliyunConfig.value?.configured) {
-    try {
-      aliyunLoading.value = true
-      showToast(`正在生成${dialect.value}回复`)
-      const result = await rewriteDialect(currentSuggestion.value.reply, dialect.value)
-      translatedReply = result.text || translatedReply
-    } catch {
-      showToast('方言改写暂不可用，已使用原回复')
-    } finally {
-      aliyunLoading.value = false
-    }
-  }
-  const message = addMessage({ speaker: 2, language: '普通话', text: currentSuggestion.value.reply, translation: translatedReply })
+  const question = currentMatter.value.suggested_question
+  if (!question) return
+  const message = addMessage({ speaker: 2, language: '普通话', text: question, translation: question })
   appliedSuggestion.value = true
-  showToast('回复已加入实时对话')
+  showToast('建议追问已加入实时对话')
   scheduleConversationAssist(1200)
   if (message) void speakMessage(message)
 }
@@ -662,8 +652,8 @@ function resetDemo() {
   view.value = 'welcome'
   void stopLiveRecognition()
   activeConversationId.value = 1
-  aiSuggestion.value = null
-  aiSummary.value = []
+  aiMatter.value = null
+  aiPolicyReference.value = null
   showToast('演示数据已重置')
 }
 
@@ -855,18 +845,30 @@ onBeforeUnmount(() => {
           </section>
 
           <aside class="insights-panel">
-            <section class="insight-card suggestion-card">
-              <div class="insight-title"><h3><Sparkles :size="21" /> AI 回复建议</h3><button :disabled="messages.length === 0 || assistLoading" @click="refreshSuggestion"><RefreshCw :size="16" :class="{ spinning: assistLoading }" />{{ assistLoading ? '生成中' : '刷新' }}</button></div>
-              <div v-if="messages.length" class="suggestion-box">
-                <p>{{ currentSuggestion.intro }}</p><ol><li v-for="item in currentSuggestion.items" :key="item">{{ item }}</li></ol><p>{{ currentSuggestion.closing }}</p>
-                <button class="use-suggestion" :class="{ applied: appliedSuggestion }" :disabled="appliedSuggestion || !isLive || aliyunLoading" @click="useSuggestion"><CheckCircle2 v-if="appliedSuggestion" :size="21" /><Bot v-else :size="21" />{{ aliyunLoading ? 'AI 正在处理' : appliedSuggestion ? '已加入实时对话' : isLive ? '使用该建议回复' : '历史建议仅供查看' }}</button>
+            <section class="insight-card matter-card">
+              <div class="insight-title"><h3><Sparkles :size="21" /> AI 事项理解</h3><button :disabled="messages.length === 0 || assistLoading" @click="refreshSuggestion"><RefreshCw :size="16" :class="{ spinning: assistLoading }" />{{ assistLoading ? '推断中' : '刷新' }}</button></div>
+              <div v-if="messages.length" class="matter-content">
+                <div class="ai-inference-warning"><Info :size="15" /><span>AI 推断候选，不构成行政判断</span></div>
+                <section class="matter-section matter-candidates"><h4>事项候选</h4><div class="candidate-tags"><span v-for="item in currentMatter.candidates" :key="item">{{ item }}</span></div></section>
+                <div class="matter-grid">
+                  <section class="matter-section"><h4>关键事实</h4><ul><li v-for="item in currentMatter.key_facts" :key="item">{{ item }}</li></ul></section>
+                  <section class="matter-section missing"><h4>缺失信息</h4><ul><li v-for="item in currentMatter.missing_information" :key="item">{{ item }}</li></ul></section>
+                </div>
+                <section class="suggested-question"><h4>建议追问</h4><p>{{ currentMatter.suggested_question }}</p></section>
+                <button class="use-suggestion" :class="{ applied: appliedSuggestion }" :disabled="appliedSuggestion || !isLive || !currentMatter.suggested_question" @click="useSuggestion"><CheckCircle2 :size="19" />{{ appliedSuggestion ? '已加入实时对话' : isLive ? '使用该追问' : '历史内容仅供查看' }}</button>
               </div>
               <div v-else class="insight-empty"><Sparkles :size="26" /><span>等待识别咨询内容</span></div>
             </section>
-            <section class="insight-card summary-card">
-              <div class="insight-title"><h3><FileText :size="21" /> 实时摘要</h3><span v-if="assistLoading" class="updating-state">更新中</span><span v-else-if="messages.length" class="updated-state">已同步</span></div>
-              <ul><li v-for="item in (expandedSummary ? summaryItems : summaryItems.slice(0, 4))" :key="item">{{ item }}</li></ul>
-              <button class="more-button" @click="expandedSummary = !expandedSummary">{{ expandedSummary ? '收起详情' : '查看更多' }} <ChevronRight :size="20" :class="{ rotated: expandedSummary }" /></button>
+            <section class="insight-card policy-card">
+              <div class="insight-title"><h3><ShieldCheck :size="21" /> 政策材料引用</h3><span v-if="assistLoading" class="updating-state">核验中</span><span v-else-if="currentPolicyReference.status === 'verified'" class="verified-state">来源已核验</span></div>
+              <div v-if="messages.length && currentPolicyReference.status === 'verified'" class="policy-reference">
+                <h4>{{ currentPolicyReference.title }}</h4>
+                <dl><div><dt>发布机构</dt><dd>{{ currentPolicyReference.issuer }}</dd></div><div><dt>版本 / 发布日期</dt><dd>{{ currentPolicyReference.version_or_date }}</dd></div><div><dt>引用位置</dt><dd>{{ currentPolicyReference.citation_location }}</dd></div></dl>
+                <a :href="currentPolicyReference.url" target="_blank" rel="noopener noreferrer">查看官方来源 <ExternalLink :size="15" /></a>
+              </div>
+              <div v-else-if="messages.length" class="policy-empty"><ShieldCheck :size="24" /><strong>无可核验参考</strong><p>当前未找到可访问且版本信息完整的官方来源，系统不会自由生成政策答案。</p></div>
+              <div v-else class="insight-empty"><ShieldCheck :size="26" /><span>等待事项信息后检索官方材料</span></div>
+              <p v-if="messages.length" class="policy-disclaimer">模块六返回的是带来源和版本的引用草案，不构成政策结论。</p>
             </section>
           </aside>
         </div>
