@@ -109,7 +109,10 @@ const voiceprintConsent = ref(false)
 const voiceprintStaffId = ref('ZY-0186')
 const voiceprintStaffName = ref('窗口工作人员')
 const transcriptList = ref<HTMLElement | null>(null)
+const serviceMenuRef = ref<HTMLElement | null>(null)
 const dialectOptions = ['粤语', '四川话', '闽南语', '东北话', '河南话', '陕西话', '山东话', '湖南话', '安徽话']
+const serviceOptions = ['政务咨询窗口', '警务服务窗口', '社保服务窗口']
+const serviceMenuOpen = ref(false)
 let clockTimer: number | undefined
 let toastTimer: number | undefined
 let assistTimer: number | undefined
@@ -232,6 +235,20 @@ function showToast(message: string) {
   toast.value = message
   window.clearTimeout(toastTimer)
   toastTimer = window.setTimeout(() => { toast.value = '' }, 2200)
+}
+
+function toggleServiceMenu(enabled = true) {
+  if (!enabled) return
+  serviceMenuOpen.value = !serviceMenuOpen.value
+}
+
+function chooseService(option: string) {
+  service.value = option
+  serviceMenuOpen.value = false
+}
+
+function closeServiceMenuOnOutsideClick(event: PointerEvent) {
+  if (!serviceMenuRef.value?.contains(event.target as Node)) serviceMenuOpen.value = false
 }
 
 function startClock() {
@@ -678,6 +695,7 @@ watch(noiseReduction, (value) => {
 })
 
 onMounted(() => {
+  document.addEventListener('pointerdown', closeServiceMenuOnOutsideClick)
   void loadAliyunConfig()
   void loadVoiceprints()
   noiseReduction.value = localStorage.getItem(NOISE_REDUCTION_KEY) !== 'false'
@@ -693,6 +711,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', closeServiceMenuOnOutsideClick)
   window.clearInterval(clockTimer)
   window.clearTimeout(toastTimer)
   window.clearTimeout(assistTimer)
@@ -730,18 +749,29 @@ onBeforeUnmount(() => {
 
         <div class="sidebar-spacer"></div>
         <button v-if="view === 'welcome'" class="settings-link" @click="settingsOpen = true"><Settings :size="21" /> 设置中心</button>
-        <button class="profile" @click="profileOpen = !profileOpen">
-          <span class="avatar"><UserRound :size="28" /><i></i></span>
-          <span><strong>窗口工作人员</strong><span>政务服务中心</span></span>
+        <button class="profile" :aria-expanded="profileOpen" aria-label="窗口工作人员账户" @click="profileOpen = !profileOpen">
+          <span class="profile-avatar"><UserRound :size="24" /><i></i></span>
+          <span class="profile-info"><strong>窗口工作人员</strong><small>政务服务中心</small></span>
           <Settings v-if="view === 'session'" :size="20" class="profile-action" />
-          <ChevronDown v-else :size="18" class="profile-action" />
+          <ChevronDown v-else :size="18" class="profile-action profile-chevron" />
         </button>
         <div v-if="profileOpen" class="profile-popover"><strong>窗口工作人员</strong><span>工号：ZY-0186</span><button @click="settingsOpen = true; profileOpen = false"><Settings :size="16" /> 偏好设置</button></div>
       </aside>
 
       <section v-if="view === 'welcome'" class="welcome-view">
         <div class="window-toolbar">
-          <label class="service-select select-control"><ShieldCheck :size="18" /><select v-model="service"><option>政务咨询窗口</option><option>警务服务窗口</option><option>社保服务窗口</option></select><ChevronDown :size="17" /></label>
+          <div ref="serviceMenuRef" class="service-picker" @keydown.esc="serviceMenuOpen = false">
+            <button class="service-select" :class="{ open: serviceMenuOpen }" type="button" aria-haspopup="listbox" :aria-expanded="serviceMenuOpen" @click="toggleServiceMenu()">
+              <ShieldCheck :size="18" /><span>{{ service }}</span><ChevronDown :size="17" class="service-chevron" />
+            </button>
+            <ul v-if="serviceMenuOpen" class="service-menu" role="listbox" aria-label="选择服务窗口">
+              <li v-for="option in serviceOptions" :key="option">
+                <button type="button" role="option" :aria-selected="service === option" :class="{ selected: service === option }" @click="chooseService(option)">
+                  <span>{{ option }}</span><CheckCircle2 v-if="service === option" :size="17" />
+                </button>
+              </li>
+            </ul>
+          </div>
           <button aria-label="最小化" title="最小化" @click="handleWindowAction('minimize')"><Minimize2 :size="20" /></button>
           <button aria-label="最大化" title="最大化" @click="handleWindowAction('maximize')"><Maximize2 :size="18" /></button>
           <button aria-label="关闭" title="关闭" @click="handleWindowAction('close')"><X :size="22" /></button>
@@ -761,7 +791,18 @@ onBeforeUnmount(() => {
 
       <section v-else class="session-view">
         <header class="session-header">
-          <label class="service-select select-control"><House :size="18" /><select v-model="service" :disabled="!isLive"><option>政务咨询窗口</option><option>警务服务窗口</option><option>社保服务窗口</option></select><ChevronDown :size="17" /></label>
+          <div ref="serviceMenuRef" class="service-picker" @keydown.esc="serviceMenuOpen = false">
+            <button class="service-select" :class="{ open: serviceMenuOpen }" type="button" :disabled="!isLive" aria-haspopup="listbox" :aria-expanded="serviceMenuOpen" @click="toggleServiceMenu(isLive)">
+              <House :size="18" /><span>{{ service }}</span><ChevronDown :size="17" class="service-chevron" />
+            </button>
+            <ul v-if="serviceMenuOpen && isLive" class="service-menu" role="listbox" aria-label="选择服务窗口">
+              <li v-for="option in serviceOptions" :key="option">
+                <button type="button" role="option" :aria-selected="service === option" :class="{ selected: service === option }" @click="chooseService(option)">
+                  <span>{{ option }}</span><CheckCircle2 v-if="service === option" :size="17" />
+                </button>
+              </li>
+            </ul>
+          </div>
           <button class="live-pill" :class="{ paused: !isListening, archived: !isLive }" :disabled="!isLive" @click="toggleListening"><i></i>{{ !isLive ? '会话已归档' : isListening ? '实时同传中' : '已暂停收音' }}</button>
           <h2>{{ sessionTitle }}</h2>
           <span class="timer"><i :class="{ paused: !isListening }"></i>{{ formattedElapsed }}<Clock3 :size="17" /></span>
